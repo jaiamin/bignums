@@ -170,9 +170,7 @@ struct MenuView: View {
     private func section(_ connection: Connection, _ breakdown: Breakdown) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(connection.institution)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                BankHeader(connection: connection)
                 Spacer()
                 if confirmingRemoval == connection.id {
                     Button("Cancel") { confirmingRemoval = nil }
@@ -183,6 +181,10 @@ struct MenuView: View {
                     .foregroundStyle(.red)
                 } else {
                     Menu {
+                        if let website = connection.websiteURL {
+                            Button("Open Website") { NSWorkspace.shared.open(website) }
+                            Divider()
+                        }
                         Button("Reconnect…") { store.reconnect(connection.id) }
                             .disabled(store.isLinking)
                         Button("Remove \(connection.institution)…", role: .destructive) { confirmingRemoval = connection.id }
@@ -356,6 +358,52 @@ private struct CircleIcon: View {
     }
 }
 
+/// Bank logo and name. Clicking opens the bank's website, where the browser fills in the saved password or passkey.
+private struct BankHeader: View {
+    let connection: Connection
+    @State private var hovering = false
+
+    var body: some View {
+        if let website = connection.websiteURL {
+            Button { NSWorkspace.shared.open(website) } label: {
+                HStack(spacing: 4) {
+                    label
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .opacity(hovering ? 1 : 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+            .help("Open \(connection.institution) website")
+        } else {
+            label
+        }
+    }
+
+    private var label: some View {
+        HStack(spacing: 6) {
+            Group {
+                if let logo = connection.logoImage {
+                    Image(nsImage: logo).resizable()
+                } else {
+                    Image(systemName: "building.columns.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.primary.opacity(0.1))
+                }
+            }
+            .frame(width: 14, height: 14)
+            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+            Text(connection.institution)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovering ? .primary : .secondary)
+        }
+    }
+}
+
 /// Merchant logo from Plaid when available, otherwise a category symbol.
 private struct MerchantIcon: View {
     let logo: URL?
@@ -415,6 +463,12 @@ private extension Transaction {
         case let c where c.hasPrefix("GENERAL_SERVICES"): "wrench.and.screwdriver.fill"
         default: "creditcard.fill"
         }
+    }
+}
+
+private extension Connection {
+    var logoImage: NSImage? {
+        logo.flatMap { Data(base64Encoded: $0) }.flatMap(NSImage.init(data:))
     }
 }
 

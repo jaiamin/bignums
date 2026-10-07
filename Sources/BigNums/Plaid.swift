@@ -138,13 +138,24 @@ struct Plaid {
         return (r.accessToken, r.itemId)
     }
 
-    func institutionName(accessToken: String) async throws -> String? {
+    struct Institution: Decodable {
+        let name: String
+        let url: String?
+        let logo: String?  // base64 PNG
+    }
+
+    /// The bank behind an Item, including its website and logo when Plaid has them.
+    func institution(accessToken: String) async throws -> Institution? {
         struct ItemResponse: Decodable { struct Item: Decodable { let institutionId: String? }; let item: Item }
-        struct InstitutionResponse: Decodable { struct Institution: Decodable { let name: String }; let institution: Institution }
+        struct InstitutionResponse: Decodable { let institution: Institution }
         let item: ItemResponse = try await call("/item/get", ["access_token": accessToken])
         guard let id = item.item.institutionId else { return nil }
-        let inst: InstitutionResponse = try await call("/institutions/get_by_id", ["institution_id": id, "country_codes": ["US"]])
-        return inst.institution.name
+        let r: InstitutionResponse = try await call("/institutions/get_by_id", [
+            "institution_id": id,
+            "country_codes": ["US"],
+            "options": ["include_optional_metadata": true],
+        ])
+        return r.institution
     }
 
     func accounts(accessToken: String) async throws -> [Account] {
