@@ -19,22 +19,28 @@ struct MenuView: View {
     @State private var confirmingRemoval: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            let totals = store.totals
-            HStack {
-                stat("Today", totals.day)
-                stat("This week", totals.week)
-                stat("This month", totals.month)
+        let breakdown = store.breakdown
+        VStack(alignment: .leading, spacing: 10) {
+            row {
+                Spacer()
+            } values: {
+                ForEach(["Today", "Week", "Month"], id: \.self) { title in
+                    Text(title).font(.caption).foregroundStyle(.secondary).frame(width: Self.column, alignment: .trailing)
+                }
+            }
+            row {
+                Text("Total").font(.headline)
+            } values: {
+                amounts(breakdown.total, font: .headline)
             }
 
             Divider()
 
-            Text("Connections").font(.caption).foregroundStyle(.secondary)
             if store.connections.isEmpty {
                 Text("No accounts connected yet.").foregroundStyle(.secondary)
             }
             ForEach(store.connections) { connection in
-                connectionRow(connection)
+                connectionSection(connection, breakdown)
             }
 
             if store.isLinking {
@@ -63,46 +69,73 @@ struct MenuView: View {
             }
         }
         .padding()
-        .frame(width: 320)
+        .frame(width: 400)
         .task { await store.refreshIfStale() }
     }
 
-    private func stat(_ title: String, _ value: Double) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
-            Text(Store.money(value)).font(.title3.weight(.semibold)).monospacedDigit()
+    private static let column: CGFloat = 64
+
+    /// A name on the left and the three fixed-width number columns on the right, so every row lines up.
+    private func row<Name: View, Values: View>(@ViewBuilder _ name: () -> Name, @ViewBuilder values: () -> Values) -> some View {
+        HStack(spacing: 0) {
+            name().frame(maxWidth: .infinity, alignment: .leading)
+            values()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func connectionRow(_ connection: Connection) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(connection.institution)
-                Group {
+    private func amounts(_ totals: Totals?, font: Font = .body) -> some View {
+        let t = totals ?? Totals()
+        return ForEach(Array([t.day, t.week, t.month].enumerated()), id: \.offset) { _, value in
+            Text(value > 0 ? Store.money(value) : "—")
+                .font(font)
+                .monospacedDigit()
+                .foregroundStyle(value > 0 ? .primary : .secondary)
+                .frame(width: Self.column, alignment: .trailing)
+        }
+    }
+
+    private func connectionSection(_ connection: Connection, _ breakdown: Breakdown) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(connection.institution).font(.subheadline.weight(.semibold))
                     if let error = connection.error {
-                        Text(error).foregroundStyle(.red)
+                        Text(error).font(.caption).foregroundStyle(.red).lineLimit(2)
                     } else if connection.cursor == nil {
-                        Text("Waiting for transactions…")
-                    } else if let synced = connection.lastSynced {
-                        Text("Updated \(synced.formatted(.relative(presentation: .named)))")
+                        Text("Waiting for transactions…").font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            }
-            Spacer()
-            if confirmingRemoval == connection.id {
-                Button("Remove", role: .destructive) {
-                    confirmingRemoval = nil
-                    Task { await store.remove(connection.id) }
+                Spacer()
+                if confirmingRemoval == connection.id {
+                    Button("Remove", role: .destructive) {
+                        confirmingRemoval = nil
+                        Task { await store.remove(connection.id) }
+                    }
+                    Button("Cancel") { confirmingRemoval = nil }
+                } else {
+                    Button { confirmingRemoval = connection.id } label: { Image(systemName: "trash") }
+                        .buttonStyle(.borderless)
+                        .help("Remove \(connection.institution)")
                 }
-                Button("Cancel") { confirmingRemoval = nil }
-            } else {
-                Button { confirmingRemoval = connection.id } label: { Image(systemName: "trash") }
-                    .buttonStyle(.borderless)
-                    .help("Remove connection")
+            }
+
+            ForEach(connection.accounts ?? []) { account in
+                let excluded = store.excludedAccounts.contains(account.id)
+                Button { store.toggleExcluded(account.id) } label: {
+                    row {
+                        Text(account.displayName)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .strikethrough(excluded)
+                            .padding(.leading, 10)
+                    } values: {
+                        amounts(breakdown.byAccount[account.id])
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .opacity(excluded ? 0.4 : 1)
+                .help(excluded ? "Excluded from totals — click to include" : "Click to exclude from totals")
             }
         }
     }

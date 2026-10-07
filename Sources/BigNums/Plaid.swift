@@ -41,10 +41,19 @@ struct Transaction: Codable {
     struct Category: Codable { let primary: String }
 
     let transactionId: String
+    let accountId: String?  // optional only so caches from before per-account support still decode
     let amount: Double  // positive = money out
     let date: String
     let authorizedDate: String?
     let personalFinanceCategory: Category?
+}
+
+struct Account: Codable, Identifiable {
+    let accountId: String
+    let name: String
+    let mask: String?
+    var id: String { accountId }
+    var displayName: String { mask.map { "\(name) ••\($0)" } ?? name }
 }
 
 struct HostedLink {
@@ -60,6 +69,7 @@ struct LinkResult {
 struct SyncResult {
     var added: [Transaction] = []
     var removed: [String] = []
+    var accounts: [Account]?
     var cursor: String
 }
 
@@ -123,6 +133,12 @@ struct Plaid {
         return inst.institution.name
     }
 
+    func accounts(accessToken: String) async throws -> [Account] {
+        struct Response: Decodable { let accounts: [Account] }
+        let r: Response = try await call("/accounts/get", ["access_token": accessToken])
+        return r.accounts
+    }
+
     func removeItem(accessToken: String) async throws {
         struct Response: Decodable {}
         let _: Response = try await call("/item/remove", ["access_token": accessToken])
@@ -132,6 +148,7 @@ struct Plaid {
     func sync(accessToken: String, cursor: String?) async throws -> SyncResult {
         struct Response: Decodable {
             struct Removed: Decodable { let transactionId: String }
+            let accounts: [Account]?
             let added: [Transaction], modified: [Transaction], removed: [Removed]
             let nextCursor: String, hasMore: Bool
         }
@@ -146,6 +163,7 @@ struct Plaid {
                     result.added += page.added + page.modified
                     result.removed += page.removed.map(\.transactionId)
                     result.cursor = page.nextCursor
+                    if let accounts = page.accounts, !accounts.isEmpty { result.accounts = accounts }  // later pages/syncs send []
                     if !page.hasMore { return result }
                 }
             } catch let e as PlaidError where e.code == "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION" && attempts < 3 {

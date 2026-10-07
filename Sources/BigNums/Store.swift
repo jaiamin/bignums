@@ -7,12 +7,24 @@ struct Connection: Codable, Identifiable {
     let accessToken: String
     var institution: String
     var cursor: String?
+    var accounts: [Account]?
     var transactions: [String: Transaction] = [:]
     var lastSynced: Date?
     var error: String?
 }
 
-struct Totals { var day = 0.0, week = 0.0, month = 0.0 }
+struct Totals {
+    var day = 0.0, week = 0.0, month = 0.0
+
+    static func += (lhs: inout Totals, rhs: Totals) {
+        lhs.day += rhs.day; lhs.week += rhs.week; lhs.month += rhs.month
+    }
+}
+
+struct Breakdown {
+    var total = Totals()
+    var byAccount: [String: Totals] = [:]
+}
 
 @MainActor @Observable
 final class Store {
@@ -21,6 +33,10 @@ final class Store {
     private(set) var isRefreshing = false
     private(set) var lastRefresh: Date?
     var message: String?
+    /// Account IDs left out of the totals. Stored in UserDefaults.
+    private(set) var excludedAccounts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "excludedAccounts") ?? []) {
+        didSet { UserDefaults.standard.set(Array(excludedAccounts), forKey: "excludedAccounts") }
+    }
 
     private var plaid: Plaid?
     private var linkTask: Task<Void, Never>?
@@ -58,27 +74,37 @@ final class Store {
 
     // MARK: Totals
 
-    var totals: Totals {
+    var breakdown: Breakdown {
         let now = lastRefresh ?? Date()
         let cal = Calendar.current
         let day = cal.startOfDay(for: now)
         let week = cal.dateInterval(of: .weekOfYear, for: now)?.start ?? day
         let month = cal.dateInterval(of: .month, for: now)?.start ?? day
 
-        var t = Totals()
+        var result = Breakdown()
         for txn in connections.flatMap(\.transactions.values) where txn.amount > 0 {
             if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
             guard let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date), date <= now else { continue }
-            if date >= day { t.day += txn.amount }
-            if date >= week { t.week += txn.amount }
-            if date >= month { t.month += txn.amount }
+            var t = Totals()
+            if date >= day { t.day = txn.amount }
+            if date >= week { t.week = txn.amount }
+            if date >= month { t.month = txn.amount }
+            if let accountID = txn.accountId {
+                result.byAccount[accountID, default: Totals()] += t
+                if excludedAccounts.contains(accountID) { continue }
+            }
+            result.total += t
         }
-        return t
+        return result
+    }
+
+    func toggleExcluded(_ accountID: String) {
+        if excludedAccounts.contains(accountID) { excludedAccounts.remove(accountID) } else { excludedAccounts.insert(accountID) }
     }
 
     var label: String {
         guard isConfigured else { return "$ ⚠︎" }
-        let t = totals
+        let t = breakdown.total
         return [t.day, t.week, t.month].map(Self.money).joined(separator: " | ")
     }
 
@@ -107,10 +133,16 @@ final class Store {
             guard let i = connections.firstIndex(where: { $0.id == id }) else { return }
             for txn in result.added { connections[i].transactions[txn.transactionId] = txn }
             for txnID in result.removed { connections[i].transactions[txnID] = nil }
+            if let accounts = result.accounts { connections[i].accounts = accounts }
             if !result.cursor.isEmpty { connections[i].cursor = result.cursor }  // empty = data not ready yet
             // Keep ~2 months so the file stays small; only the current month is ever displayed.
             let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-62 * 86400))
             connections[i].transactions = connections[i].transactions.filter { $0.value.date >= cutoff }
+            if connections[i].accounts?.isEmpty ?? true, let accounts = try? await plaid.accounts(accessToken: connection.accessToken),
+               let i = connections.firstIndex(where: { $0.id == id }) {
+                connections[i].accounts = accounts
+            }
+            guard let i = connections.firstIndex(where: { $0.id == id }) else { return }
             connections[i].lastSynced = Date()
             connections[i].error = nil
         } catch {
@@ -181,6 +213,7 @@ final class Store {
             message = "Couldn't remove \(connection.institution): \(error.localizedDescription)"
             return
         }
+        excludedAccounts.subtract(connection.accounts?.map(\.id) ?? [])
         connections.removeAll { $0.id == id }
         save()
     }
@@ -190,6 +223,11 @@ final class Store {
     private func load() {
         guard let data = try? Data(contentsOf: Self.fileURL) else { return }
         connections = (try? JSONDecoder().decode([Connection].self, from: data)) ?? []
+        // Caches from before per-account support lack account IDs: drop them and re-sync from scratch once.
+        for i in connections.indices where connections[i].accounts == nil || connections[i].transactions.values.contains(where: { $0.accountId == nil }) {
+            connections[i].cursor = nil
+            connections[i].transactions = [:]
+        }
     }
 
     private func save() {
