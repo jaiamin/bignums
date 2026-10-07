@@ -11,6 +11,13 @@ struct Connection: Codable, Identifiable {
     var transactions: [String: Transaction] = [:]
     var lastSynced: Date?
     var error: String?
+    var errorCode: String?
+
+    /// Errors only the user can fix by logging in to the bank again through Plaid.
+    var needsReconnect: Bool {
+        ["ITEM_LOGIN_REQUIRED", "PENDING_EXPIRATION", "PENDING_DISCONNECT", "INVALID_CREDENTIALS", "INVALID_MFA",
+         "USER_SETUP_REQUIRED", "ACCESS_NOT_GRANTED", "NO_ACCOUNTS"].contains(errorCode ?? "")
+    }
 }
 
 struct Totals {
@@ -69,6 +76,13 @@ final class Store {
         do { plaid = Plaid(config: try PlaidConfig.load()) } catch { message = error.localizedDescription }
         timer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
             Task { await self?.refresh() }
+        }
+        // Refresh after sleep so "today" doesn't show yesterday's numbers; wait a moment for the network to return.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task {
+                try? await Task.sleep(for: .seconds(10))
+                await self?.refresh()
+            }
         }
         Task { await refresh() }
     }
@@ -150,8 +164,12 @@ final class Store {
             guard let i = connections.firstIndex(where: { $0.id == id }) else { return }
             connections[i].lastSynced = Date()
             connections[i].error = nil
+            connections[i].errorCode = nil
         } catch {
-            if let i = connections.firstIndex(where: { $0.id == id }) { connections[i].error = error.localizedDescription }
+            if let i = connections.firstIndex(where: { $0.id == id }) {
+                connections[i].error = error.localizedDescription
+                connections[i].errorCode = (error as? PlaidError)?.code
+            }
         }
         save()
     }
@@ -159,23 +177,39 @@ final class Store {
     // MARK: Connections
 
     func addConnection() {
+        runLink(updating: nil) { [weak self] results in
+            for result in results { try await self?.finishLink(result) }
+        }
+    }
+
+    /// Re-login to a bank via Plaid update mode. The access token doesn't change, so we just re-sync afterwards:
+    /// if the user fixed the login, the error clears; if they bailed, it stays.
+    func reconnect(_ id: String) {
+        guard let connection = connections.first(where: { $0.id == id }) else { return }
+        runLink(updating: connection.accessToken) { [weak self] _ in
+            await self?.sync(id)
+            self?.lastRefresh = Date()
+        }
+    }
+
+    /// Opens Hosted Link in the browser and polls until the session finishes (or 30 minutes pass).
+    private func runLink(updating accessToken: String?, onFinish: @escaping ([LinkResult]) async throws -> Void) {
         guard let plaid, !isLinking else { return }
         isLinking = true
         message = nil
         linkTask = Task {
             defer { isLinking = false }
             do {
-                let link = try await plaid.createHostedLink()
+                let link = try await plaid.createHostedLink(updating: accessToken)
                 NSWorkspace.shared.open(link.url)
                 let deadline = Date().addingTimeInterval(30 * 60)
                 while Date() < deadline {
                     try await Task.sleep(for: .seconds(3))
                     let status = try await plaid.linkStatus(link.token)
-                    if !status.results.isEmpty {
-                        for result in status.results { try await finishLink(result) }
+                    if !status.results.isEmpty || status.finished {
+                        try await onFinish(status.results)  // results is empty if the user exited without finishing
                         return
                     }
-                    if status.finished { return }  // user closed Link without connecting
                 }
             } catch is CancellationError {
             } catch {

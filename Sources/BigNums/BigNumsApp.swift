@@ -45,11 +45,12 @@ struct MenuView: View {
     let store: Store
     @AppStorage("period") private var period: Period = .month
     @State private var confirmingRemoval: String?
+    @State private var contentHeight: CGFloat = 0
 
     var body: some View {
         let breakdown = store.breakdown
         VStack(alignment: .leading, spacing: 0) {
-            Picker("Period", selection: $period.animation(.snappy)) {
+            Picker("Period", selection: $period) {
                 ForEach(Period.allCases) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
@@ -60,6 +61,9 @@ struct MenuView: View {
                     .font(.system(size: 34, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .contentTransition(.numericText())
+                    // Animate only the number: animating the layout makes the content resize smoothly while the
+                    // menu window jumps to its new size, leaving see-through gaps at the top and bottom.
+                    .animation(.snappy, value: period)
                 Text(period.caption)
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -94,6 +98,9 @@ struct MenuView: View {
         }
         .padding(12)
         .frame(width: 320)
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+        .background(WindowSizer(contentHeight: contentHeight))
         .task { await store.refreshIfStale() }
     }
 
@@ -169,6 +176,8 @@ struct MenuView: View {
                     .foregroundStyle(.red)
                 } else {
                     Menu {
+                        Button("Reconnect…") { store.reconnect(connection.id) }
+                            .disabled(store.isLinking)
                         Button("Remove \(connection.institution)…", role: .destructive) { confirmingRemoval = connection.id }
                     } label: {
                         Image(systemName: "ellipsis")
@@ -186,7 +195,17 @@ struct MenuView: View {
             .padding(.top, 10)
 
             if let error = connection.error {
-                status(error, color: .red)
+                HStack(alignment: .firstTextBaseline) {
+                    status(error, color: .red)
+                    if connection.needsReconnect {
+                        Spacer()
+                        Button("Reconnect") { store.reconnect(connection.id) }
+                            .buttonStyle(.borderless)
+                            .font(.caption.weight(.semibold))
+                            .disabled(store.isLinking)
+                            .padding(.trailing, 6)
+                    }
+                }
             } else if connection.cursor == nil {
                 status("Waiting for transactions…", color: .secondary)
             }
@@ -274,6 +293,25 @@ struct MenuView: View {
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 6)
+    }
+}
+
+/// MenuBarExtra's window grows with its content but doesn't shrink back, leaving the content centered between
+/// empty bands. Resize the window to the measured content height ourselves, keeping its top edge under the menu bar.
+private struct WindowSizer: NSViewRepresentable {
+    let contentHeight: CGFloat
+
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let window = view.window, contentHeight > 0 else { return }
+            let frame = window.frame
+            let delta = contentHeight - window.contentRect(forFrameRect: frame).height
+            guard abs(delta) > 0.5 else { return }
+            let height = frame.height + delta
+            window.setFrame(NSRect(x: frame.minX, y: frame.maxY - height, width: frame.width, height: height), display: true)
+        }
     }
 }
 

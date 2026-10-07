@@ -86,16 +86,22 @@ private struct APIError: Decodable { let errorCode: String; let errorMessage: St
 struct Plaid {
     let config: PlaidConfig
 
-    func createHostedLink() async throws -> HostedLink {
+    /// Pass an access token to open Link in update mode (re-login to an existing Item) instead of adding a new one.
+    func createHostedLink(updating accessToken: String? = nil) async throws -> HostedLink {
         struct Response: Decodable { let linkToken: String; let hostedLinkUrl: String? }
-        let r: Response = try await call("/link/token/create", [
+        var body: [String: Any] = [
             "client_name": "BigNums",
             "language": "en",
             "country_codes": ["US"],
             "user": ["client_user_id": "bignums-local-user"],
-            "products": ["transactions"],
             "hosted_link": [String: Any](),
-        ])
+        ]
+        if let accessToken {
+            body["access_token"] = accessToken  // update mode must not list products
+        } else {
+            body["products"] = ["transactions"]
+        }
+        let r: Response = try await call("/link/token/create", body)
         guard let url = r.hostedLinkUrl.flatMap(URL.init(string:)) else {
             throw PlaidError(code: "NO_HOSTED_LINK", message: "Plaid did not return a Hosted Link URL.")
         }
