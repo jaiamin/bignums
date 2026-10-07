@@ -45,6 +45,7 @@ struct MenuView: View {
     let store: Store
     @AppStorage("period") private var period: Period = .month
     @State private var confirmingRemoval: String?
+    @State private var window: NSWindow?
     @State private var contentHeight: CGFloat = 0
 
     var body: some View {
@@ -99,8 +100,14 @@ struct MenuView: View {
         .padding(12)
         .frame(width: 320)
         .fixedSize(horizontal: false, vertical: true)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
-        .background(WindowSizer(contentHeight: contentHeight))
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+            contentHeight = height
+            fitWindow(window, to: height)
+        }
+        .background(WindowReader { found in
+            window = found
+            fitWindow(found, to: contentHeight)
+        })
         .task { await store.refreshIfStale() }
     }
 
@@ -298,19 +305,39 @@ struct MenuView: View {
 
 /// MenuBarExtra's window grows with its content but doesn't shrink back, leaving the content centered between
 /// empty bands. Resize the window to the measured content height ourselves, keeping its top edge under the menu bar.
-private struct WindowSizer: NSViewRepresentable {
-    let contentHeight: CGFloat
+/// Resizing, relayout and redraw happen in one transaction so no unpainted (black) area flashes in between.
+@MainActor
+private func fitWindow(_ window: NSWindow?, to contentHeight: CGFloat) {
+    guard let window, contentHeight > 0 else { return }
+    let frame = window.frame
+    let delta = contentHeight - window.contentRect(forFrameRect: frame).height
+    guard abs(delta) > 0.5 else { return }
+    let height = frame.height + delta
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    window.setFrame(NSRect(x: frame.minX, y: frame.maxY - height, width: frame.width, height: height), display: false)
+    window.contentView?.layoutSubtreeIfNeeded()
+    window.displayIfNeeded()
+    CATransaction.commit()
+}
 
-    func makeNSView(context: Context) -> NSView { NSView() }
+/// Hands back the NSWindow hosting the SwiftUI content once it's attached.
+private struct WindowReader: NSViewRepresentable {
+    let onWindow: (NSWindow) -> Void
 
-    func updateNSView(_ view: NSView, context: Context) {
-        DispatchQueue.main.async {
-            guard let window = view.window, contentHeight > 0 else { return }
-            let frame = window.frame
-            let delta = contentHeight - window.contentRect(forFrameRect: frame).height
-            guard abs(delta) > 0.5 else { return }
-            let height = frame.height + delta
-            window.setFrame(NSRect(x: frame.minX, y: frame.maxY - height, width: frame.width, height: height), display: true)
+    func makeNSView(context: Context) -> NSView { ReaderView(onWindow: onWindow) }
+    func updateNSView(_ view: NSView, context: Context) {}
+
+    private final class ReaderView: NSView {
+        let onWindow: (NSWindow) -> Void
+        init(onWindow: @escaping (NSWindow) -> Void) {
+            self.onWindow = onWindow
+            super.init(frame: .zero)
+        }
+        required init?(coder: NSCoder) { fatalError() }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window { DispatchQueue.main.async { self.onWindow(window) } }
         }
     }
 }
