@@ -103,7 +103,6 @@ final class Store {
     }
 
     var label: String {
-        guard isConfigured else { return "$ ⚠︎" }
         let t = breakdown.total
         return [t.day, t.week, t.month].map(Self.money).joined(separator: " | ")
     }
@@ -138,7 +137,8 @@ final class Store {
             // Keep ~2 months so the file stays small; only the current month is ever displayed.
             let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-62 * 86400))
             connections[i].transactions = connections[i].transactions.filter { $0.value.date >= cutoff }
-            if connections[i].accounts?.isEmpty ?? true, let accounts = try? await plaid.accounts(accessToken: connection.accessToken),
+            // Fetch the account list if we've never received one (or saved it before account types were stored).
+            if connections[i].accounts.map({ $0.isEmpty || $0.contains { $0.type == nil } }) ?? true, let accounts = try? await plaid.accounts(accessToken: connection.accessToken),
                let i = connections.firstIndex(where: { $0.id == id }) {
                 connections[i].accounts = accounts
             }

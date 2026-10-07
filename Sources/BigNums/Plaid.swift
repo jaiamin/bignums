@@ -52,8 +52,9 @@ struct Account: Codable, Identifiable {
     let accountId: String
     let name: String
     let mask: String?
+    let type: String?  // credit, depository, loan, investment
+    let subtype: String?  // credit card, checking, savings, ...
     var id: String { accountId }
-    var displayName: String { mask.map { "\(name) ••\($0)" } ?? name }
 }
 
 struct HostedLink {
