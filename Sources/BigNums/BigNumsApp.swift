@@ -70,6 +70,9 @@ struct MenuView: View {
 
             if store.connections.isEmpty {
                 emptyState
+            } else if period == .day {
+                todayPurchases(breakdown.today)
+                Divider().padding(.top, 8).padding(.bottom, 2)
             }
             ForEach(store.connections) { connection in
                 section(connection, breakdown)
@@ -109,6 +112,45 @@ struct MenuView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 16)
+    }
+
+    private func todayPurchases(_ purchases: [Transaction]) -> some View {
+        let accounts = Dictionary(store.connections.flatMap { $0.accounts ?? [] }.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let shown = purchases.prefix(Self.maxPurchases)
+        return VStack(alignment: .leading, spacing: 2) {
+            if purchases.isEmpty {
+                status("No purchases yet today", color: .secondary)
+            }
+            ForEach(shown, id: \.transactionId) { txn in
+                purchaseRow(txn, account: txn.accountId.flatMap { accounts[$0] })
+            }
+            if purchases.count > shown.count {
+                status("+\(purchases.count - shown.count) more", color: .secondary)
+            }
+        }
+    }
+
+    private static let maxPurchases = 6
+
+    private func purchaseRow(_ txn: Transaction, account: Account?) -> some View {
+        let detail = [account.map { [$0.name, $0.mask.map { "••\($0)" }].compactMap { $0 }.joined(separator: " ") },
+                      txn.pending == true ? "Pending" : nil]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+        return HStack(spacing: 10) {
+            MerchantIcon(logo: txn.logoUrl.flatMap(URL.init(string:)), symbol: txn.symbol)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(txn.merchantName ?? txn.name ?? "Purchase").lineLimit(1)
+                if !detail.isEmpty {
+                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            Text(txn.amount.formatted(.currency(code: "USD")))
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
     }
 
     private func section(_ connection: Connection, _ breakdown: Breakdown) -> some View {
@@ -249,6 +291,22 @@ private struct CircleIcon: View {
     }
 }
 
+/// Merchant logo from Plaid when available, otherwise a category symbol.
+private struct MerchantIcon: View {
+    let logo: URL?
+    let symbol: String
+
+    var body: some View {
+        AsyncImage(url: logo) { image in
+            image.resizable().scaledToFill()
+        } placeholder: {
+            CircleIcon(symbol: symbol, filled: false)
+        }
+        .frame(width: 26, height: 26)
+        .clipShape(Circle())
+    }
+}
+
 /// Full-width menu row with the rounded hover highlight macOS menus use.
 private struct RowButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
@@ -272,6 +330,25 @@ private struct RowButtonStyle: ButtonStyle {
                 )
                 .opacity(isEnabled ? 1 : 0.5)
                 .onHover { hovering = $0 }
+        }
+    }
+}
+
+private extension Transaction {
+    var symbol: String {
+        switch personalFinanceCategory?.detailed ?? personalFinanceCategory?.primary ?? "" {
+        case let c where c.hasPrefix("FOOD_AND_DRINK_GROCERIES"): "cart.fill"
+        case let c where c.hasPrefix("FOOD_AND_DRINK"): "fork.knife"
+        case let c where c.hasPrefix("GENERAL_MERCHANDISE"): "bag.fill"
+        case let c where c.hasPrefix("TRANSPORTATION"): "car.fill"
+        case let c where c.hasPrefix("TRAVEL"): "airplane"
+        case let c where c.hasPrefix("ENTERTAINMENT"): "tv.fill"
+        case let c where c.hasPrefix("RENT_AND_UTILITIES"): "house.fill"
+        case let c where c.hasPrefix("MEDICAL"): "cross.case.fill"
+        case let c where c.hasPrefix("PERSONAL_CARE"): "heart.fill"
+        case let c where c.hasPrefix("HOME_IMPROVEMENT"): "hammer.fill"
+        case let c where c.hasPrefix("GENERAL_SERVICES"): "wrench.and.screwdriver.fill"
+        default: "creditcard.fill"
         }
     }
 }

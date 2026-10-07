@@ -38,13 +38,20 @@ struct PlaidConfig {
 }
 
 struct Transaction: Codable {
-    struct Category: Codable { let primary: String }
+    struct Category: Codable { let primary: String; let detailed: String? }
 
+    // Most fields are optional only so older caches still decode (they are then re-synced).
     let transactionId: String
-    let accountId: String?  // optional only so caches from before per-account support still decode
+    let accountId: String?
     let amount: Double  // positive = money out
     let date: String
     let authorizedDate: String?
+    let datetime: String?
+    let authorizedDatetime: String?
+    let name: String?
+    let merchantName: String?
+    let logoUrl: String?
+    let pending: Bool?
     let personalFinanceCategory: Category?
 }
 

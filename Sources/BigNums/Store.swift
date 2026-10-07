@@ -24,6 +24,7 @@ struct Totals {
 struct Breakdown {
     var total = Totals()
     var byAccount: [String: Totals] = [:]
+    var today: [Transaction] = []  // counted purchases from today, newest first
 }
 
 @MainActor @Observable
@@ -94,6 +95,10 @@ final class Store {
                 if excludedAccounts.contains(accountID) { continue }
             }
             result.total += t
+            if t.day > 0 { result.today.append(txn) }
+        }
+        result.today.sort {
+            ($0.authorizedDatetime ?? $0.datetime ?? $0.date) > ($1.authorizedDatetime ?? $1.datetime ?? $1.date)
         }
         return result
     }
@@ -223,8 +228,9 @@ final class Store {
     private func load() {
         guard let data = try? Data(contentsOf: Self.fileURL) else { return }
         connections = (try? JSONDecoder().decode([Connection].self, from: data)) ?? []
-        // Caches from before per-account support lack account IDs: drop them and re-sync from scratch once.
-        for i in connections.indices where connections[i].accounts == nil || connections[i].transactions.values.contains(where: { $0.accountId == nil }) {
+        // Caches from older versions lack account IDs or merchant names: drop them and re-sync from scratch once.
+        for i in connections.indices where connections[i].accounts == nil
+            || connections[i].transactions.values.contains(where: { $0.accountId == nil || $0.name == nil }) {
             connections[i].cursor = nil
             connections[i].transactions = [:]
         }
