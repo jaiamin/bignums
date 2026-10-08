@@ -75,8 +75,12 @@ struct MenuView: View {
 
             if store.connections.isEmpty {
                 emptyState
-            } else if period == .day {
-                todayPurchases(breakdown.today)
+            } else {
+                if period == .day {
+                    todayPurchases(breakdown.today)
+                } else {
+                    topMerchants(period == .week ? breakdown.week : breakdown.month, total: period.value(breakdown.total))
+                }
                 Divider().padding(.top, 8).padding(.bottom, 2)
             }
             ForEach(store.connections) { connection in
@@ -130,7 +134,7 @@ struct MenuView: View {
 
     private func todayPurchases(_ purchases: [Transaction]) -> some View {
         let accounts = Dictionary(store.connections.flatMap { $0.accounts ?? [] }.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        let shown = purchases.prefix(Self.maxPurchases)
+        let shown = purchases.prefix(Self.maxRows)
         return VStack(alignment: .leading, spacing: 2) {
             if purchases.isEmpty {
                 status("No purchases yet today", color: .secondary)
@@ -144,7 +148,41 @@ struct MenuView: View {
         }
     }
 
-    private static let maxPurchases = 6
+    /// Same row cap on every tab, so the menu keeps a steady height when switching periods.
+    private static let maxRows = 5
+
+    private func topMerchants(_ purchases: [Transaction], total: Double) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Top Merchants")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.top, 4)
+            if purchases.isEmpty {
+                status(period == .week ? "No purchases yet this week" : "No purchases yet this month", color: .secondary)
+            }
+            ForEach(MerchantTotal.top(purchases, limit: Self.maxRows)) { merchant in
+                HStack(spacing: 10) {
+                    MerchantIcon(logo: merchant.sample.logoUrl.flatMap(URL.init(string:)), symbol: merchant.sample.symbol)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(merchant.name).lineLimit(1)
+                        HStack(spacing: 8) {
+                            Text(merchant.count == 1 ? "1 purchase" : "\(merchant.count) purchases")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize()
+                            ShareBar(share: total > 0 ? merchant.total / total : 0)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(merchant.total.formatted(.currency(code: "USD")))
+                        .monospacedDigit()
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+            }
+        }
+    }
 
     private func purchaseRow(_ txn: Transaction, account: Account?) -> some View {
         let detail = [account.map { [$0.name, $0.mask.map { "••\($0)" }].compactMap { $0 }.joined(separator: " ") },
@@ -401,6 +439,25 @@ private struct BankHeader: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(hovering ? .primary : .secondary)
         }
+    }
+}
+
+/// Thin bar showing a merchant's share of the period's spending, like Screen Time's "Most Used" list.
+private struct ShareBar: View {
+    let share: Double
+
+    var body: some View {
+        Capsule()
+            .fill(Color.primary.opacity(0.08))
+            .frame(height: 4)
+            .overlay(alignment: .leading) {
+                GeometryReader { geometry in
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: max(4, geometry.size.width * min(share, 1)))
+                }
+            }
+            .help(share.formatted(.percent.precision(.fractionLength(0))) + " of spending")
     }
 }
 

@@ -40,7 +40,28 @@ struct Totals {
 struct Breakdown {
     var total = Totals()
     var byAccount: [String: Totals] = [:]
-    var today: [Transaction] = []  // counted purchases from today, newest first
+    var today: [Transaction] = []  // counted purchases from today, biggest first
+    var week: [Transaction] = []  // counted purchases this week / month, unordered
+    var month: [Transaction] = []
+}
+
+struct MerchantTotal: Identifiable {
+    let name: String
+    var total: Double
+    var count: Int
+    let sample: Transaction  // supplies the logo and category icon
+    var id: String { name.lowercased() }
+
+    /// Purchases grouped by merchant, biggest total first.
+    static func top(_ purchases: [Transaction], limit: Int) -> [MerchantTotal] {
+        var groups: [String: MerchantTotal] = [:]
+        for txn in purchases {
+            let name = txn.merchantName ?? txn.name ?? "Other"
+            groups[name.lowercased(), default: MerchantTotal(name: name, total: 0, count: 0, sample: txn)].total += txn.amount
+            groups[name.lowercased()]!.count += 1
+        }
+        return Array(groups.values.sorted { $0.total > $1.total }.prefix(limit))
+    }
 }
 
 @MainActor @Observable
@@ -119,10 +140,10 @@ final class Store {
             }
             result.total += t
             if t.day > 0 { result.today.append(txn) }
+            if t.week > 0 { result.week.append(txn) }
+            if t.month > 0 { result.month.append(txn) }
         }
-        result.today.sort {
-            ($0.authorizedDatetime ?? $0.datetime ?? $0.date) > ($1.authorizedDatetime ?? $1.datetime ?? $1.date)
-        }
+        result.today.sort { $0.amount > $1.amount }
         return result
     }
 
