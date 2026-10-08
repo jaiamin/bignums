@@ -166,8 +166,17 @@ final class Store {
     /// Menu bar text: always the current day, week and month, whatever the menu is browsing.
     var label: String {
         Period.allCases
-            .map { Self.money(breakdown($0.interval(offset: 0, from: referenceDate)).total) }
+            .map { Self.compactMoney(breakdown($0.interval(offset: 0, from: referenceDate)).total) }
             .joined(separator: " | ")
+    }
+
+    /// "$987", "$3.2K", "$12.6K", "$126K": keeps the menu bar item narrow and roughly the same width all month,
+    /// so macOS doesn't hide it behind the notch. The exact figure is in the menu.
+    static func compactMoney(_ value: Double) -> String {
+        let rounded = value.rounded()
+        if rounded < 1000 { return "$\(Int(rounded))" }
+        let (scaled, suffix) = rounded < 1_000_000 ? (rounded / 1000, "K") : (rounded / 1_000_000, "M")
+        return "$" + scaled.formatted(.number.precision(.fractionLength(0...(scaled < 100 ? 1 : 0)))) + suffix
     }
 
     static func money(_ value: Double) -> String {
