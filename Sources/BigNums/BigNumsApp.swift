@@ -2,7 +2,14 @@ import SwiftUI
 
 @main
 struct BigNumsApp: App {
-    @State private var store = Store()
+    @State private var store: Store
+
+    init() {
+        #if DEBUG
+        Snapshot.renderIfRequested()
+        #endif
+        _store = State(initialValue: Store())
+    }
 
     var body: some Scene {
         MenuBarExtra {
@@ -21,80 +28,46 @@ struct BigNumsApp: App {
 struct MenuView: View {
     let store: Store
     @AppStorage("period") private var period: Period = .month
+    @AppStorage("accountsExpanded") private var accountsExpanded = false
     @State private var offset = 0  // 0 = current period, -1 = previous, ...
-    @State private var confirmingRemoval: String?
+    @State private var removing: String?  // connection awaiting remove confirmation
     @State private var window: NSWindow?
     @State private var contentHeight: CGFloat = 0
+
+    /// Same row cap on every tab, so the menu keeps a steady height when switching periods.
+    private static let maxRows = 5
 
     var body: some View {
         let interval = period.interval(offset: offset, from: store.referenceDate)
         let breakdown = store.breakdown(interval)
         VStack(alignment: .leading, spacing: 0) {
-            Picker("Period", selection: $period) {
-                ForEach(Period.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(Store.money(breakdown.total))
-                    .font(.system(size: 34, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                    // Animate only the number: animating the layout makes the content resize smoothly while the
-                    // menu window jumps to its new size, leaving see-through gaps at the top and bottom.
-                    .animation(.snappy, value: interval)
-                HStack(spacing: 2) {
-                    Text(title(interval))
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button { offset -= 1 } label: { Image(systemName: "chevron.left").frame(width: 22, height: 20) }
-                        .disabled(!(store.historyStart.map { interval.start > $0 } ?? false))
-                        .help("Previous")
-                    Button { offset += 1 } label: { Image(systemName: "chevron.right").frame(width: 22, height: 20) }
-                        .disabled(offset >= 0)
-                        .help("Next")
-                }
-                .buttonStyle(.borderless)
-                // Always reserve the line so the menu doesn't change height when there's nothing to compare.
-                Text(comparison(interval, spent: breakdown.total) ?? " ")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 6)
-            .padding(.top, 14)
-            .padding(.bottom, 6)
-
             if store.connections.isEmpty {
                 emptyState
             } else {
-                if period == .day {
-                    dayPurchases(breakdown.purchases)
-                } else {
-                    topMerchants(breakdown.purchases, total: breakdown.total)
-                }
-                Divider().padding(.top, 8).padding(.bottom, 2)
-            }
-            ForEach(store.connections) { connection in
-                section(connection, breakdown)
+                toolbar(interval)
+                summary(interval, breakdown)
+                    .padding(.top, 18)
+                spending(breakdown)
+                    .padding(.top, 22)
+                accounts(breakdown)
+                    .padding(.top, 22)
             }
 
             if let message = store.message {
                 Text(message)
-                    .font(.caption)
+                    .font(.system(size: 11))
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 6)
-                    .padding(.top, 8)
+                    .padding(.horizontal, Self.inset)
+                    .padding(.top, 12)
             }
 
-            Divider().padding(.vertical, 8)
-            addRow
-            Divider().padding(.vertical, 8)
+            Divider()
+                .padding(.top, 14)
+                .padding(.bottom, 8)
             footer
         }
-        .padding(12)
+        .padding(14)
         .frame(width: 320)
         .fixedSize(horizontal: false, vertical: true)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
@@ -109,8 +82,329 @@ struct MenuView: View {
         .onChange(of: period) { offset = 0 }
         // Closing the menu returns it to the current period, so it never reopens on old numbers.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { note in
-            if note.object as? NSWindow === window { offset = 0 }
+            if note.object as? NSWindow === window {
+                offset = 0
+                removing = nil
+            }
         }
+    }
+
+    /// Everything shares one left edge: the outer padding plus this inset, which leaves room for row hover highlights.
+    fileprivate static let inset: CGFloat = 6
+
+    // MARK: Header
+
+    private func toolbar(_ interval: DateInterval) -> some View {
+        HStack(spacing: 0) {
+            Picker("Period", selection: $period) {
+                ForEach(Period.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            Spacer()
+            stepButton("chevron.left", help: "Previous \(period.unit)") { offset -= 1 }
+                .disabled(!(store.historyStart.map { interval.start > $0 } ?? false))
+            stepButton("chevron.right", help: "Next \(period.unit)") { offset += 1 }
+                .disabled(offset >= 0)
+        }
+    }
+
+    private func stepButton(_ symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 26, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+    }
+
+    private func summary(_ interval: DateInterval, _ breakdown: Breakdown) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title(interval))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+            HeroAmount(value: breakdown.total)
+            // Always reserve the line so the menu doesn't change height when there's nothing to compare.
+            Text(comparison(interval, spent: breakdown.total) ?? " ")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, Self.inset)
+    }
+
+    // MARK: Spending
+
+    @ViewBuilder
+    private func spending(_ breakdown: Breakdown) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SectionTitle(period == .day ? "Top purchases" : "Top merchants")
+            if breakdown.purchases.isEmpty {
+                Note(offset == 0 ? "No purchases yet \(period == .day ? "today" : "this \(period.unit)")" : "No purchases")
+            } else if period == .day {
+                let accounts = store.accountsByID
+                ForEach(breakdown.purchases.prefix(Self.maxRows), id: \.transactionId) { txn in
+                    purchaseRow(txn, account: txn.accountId.flatMap { accounts[$0] })
+                }
+                let more = breakdown.purchases.count - Self.maxRows
+                if more > 0 {
+                    Note(more == 1 ? "1 more purchase" : "\(more) more purchases")
+                }
+            } else {
+                ForEach(MerchantTotal.top(breakdown.purchases, limit: Self.maxRows)) { merchant in
+                    merchantRow(merchant, share: breakdown.total > 0 ? merchant.total / breakdown.total : 0)
+                }
+            }
+        }
+    }
+
+    private func purchaseRow(_ txn: Transaction, account: Account?) -> some View {
+        let card = account?.shortName
+        let detail = txn.pending == true ? card.map { "Pending on \($0)" } ?? "Pending" : card
+        return ItemRow(title: txn.merchantName ?? txn.name ?? "Purchase", amount: txn.amount) {
+            MerchantIcon(logo: txn.logoUrl.flatMap(URL.init(string:)), symbol: txn.symbol)
+        } detail: {
+            if let detail { Text(detail) }
+        }
+        .padding(.horizontal, Self.inset)
+    }
+
+    private func merchantRow(_ merchant: MerchantTotal, share: Double) -> some View {
+        ItemRow(title: merchant.name, amount: merchant.total) {
+            MerchantIcon(logo: merchant.sample.logoUrl.flatMap(URL.init(string:)), symbol: merchant.sample.symbol)
+        } detail: {
+            HStack(spacing: 8) {
+                Text(merchant.count == 1 ? "1 purchase" : "\(merchant.count) purchases")
+                    .fixedSize()
+                ShareBar(share: share)
+            }
+        }
+        .padding(.horizontal, Self.inset)
+    }
+
+    // MARK: Accounts
+
+    private func accounts(_ breakdown: Breakdown) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            accountsHeader
+            if accountsExpanded {
+                accountList(breakdown)
+            }
+        }
+    }
+
+    /// Collapsible header. While collapsed it still surfaces problems, so a broken bank can't go unnoticed.
+    private var accountsHeader: some View {
+        let count = store.connections.reduce(0) { $0 + max($1.accounts?.count ?? 0, 1) }
+        let problem: String? = store.connections.lazy.compactMap { connection -> String? in
+            if connection.needsReconnect { return "\(connection.institution) needs you to sign in again" }
+            if connection.error != nil { return "\(connection.institution) can't update" }
+            return nil
+        }.first
+        return Button { accountsExpanded.toggle() } label: {
+            HStack(spacing: 6) {
+                Text("Accounts")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let problem, !accountsExpanded {
+                    Text(problem)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                } else {
+                    Text("\(count)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Image(systemName: accountsExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 12)
+            }
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(RowButtonStyle())
+        .help(accountsExpanded ? "Hide accounts" : "Show accounts")
+    }
+
+    private func accountList(_ breakdown: Breakdown) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(store.connections) { connection in
+                if removing == connection.id {
+                    removeConfirmation(connection)
+                } else if let accounts = connection.accounts, !accounts.isEmpty {
+                    ForEach(accounts) { account in
+                        accountRow(account, in: connection, value: breakdown.byAccount[account.id] ?? 0)
+                    }
+                } else {
+                    // Just connected (or never synced): one row for the bank until its accounts arrive.
+                    Button { showActions(for: connection, account: nil) } label: {
+                        ItemRow(title: connection.institution) {
+                            BankLogo(connection: connection)
+                        } detail: {
+                            Text(connection.error ?? "Getting your accounts…")
+                                .foregroundStyle(connection.error == nil ? Color.secondary : Color.red)
+                        }
+                    }
+                    .buttonStyle(RowButtonStyle())
+                }
+            }
+            addAccountRow
+        }
+    }
+
+    private func accountRow(_ account: Account, in connection: Connection, value: Double) -> some View {
+        let counted = !store.excludedAccounts.contains(account.id)
+        let detail: Text = if connection.needsReconnect {
+            Text("Sign-in expired. Click to reconnect.").foregroundStyle(.red)
+        } else if let error = connection.error {
+            Text(error).foregroundStyle(.red)
+        } else if !counted {
+            Text("Not counted in totals")
+        } else {
+            Text(account.kind)
+        }
+        return Button { showActions(for: connection, account: account) } label: {
+            ItemRow(title: account.displayName, amount: value) {
+                BankLogo(connection: connection)
+            } detail: {
+                detail
+            }
+            .opacity(counted ? 1 : 0.5)
+        }
+        .buttonStyle(RowButtonStyle())
+        .help("Options for \(account.displayName)")
+    }
+
+    /// Native menu with everything you can do to an account and its bank.
+    private func showActions(for connection: Connection, account: Account?) {
+        var items: [ActionMenu.Item] = []
+        if let account {
+            let counted = !store.excludedAccounts.contains(account.id)
+            items.append(.action("Count in totals", checked: counted) { store.toggleExcluded(account.id) })
+            items.append(.divider)
+        }
+        if let website = connection.websiteURL {
+            items.append(.action("Open \(connection.institution) website") { NSWorkspace.shared.open(website) })
+        }
+        if !store.isLinking {
+            items.append(.action("Reconnect \(connection.institution)…") { store.reconnect(connection.id) })
+        }
+        items.append(.divider)
+        items.append(.action("Remove \(connection.institution)…") { removing = connection.id })
+        ActionMenu.show(items)
+    }
+
+    private func removeConfirmation(_ connection: Connection) -> some View {
+        let count = connection.accounts?.count ?? 0
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("Remove \(connection.institution)?")
+                .font(.system(size: 13, weight: .semibold))
+            Text(count == 1 ? "Its account will be disconnected from BigNums."
+                 : count > 1 ? "Its \(count) accounts will be disconnected from BigNums."
+                 : "It will be disconnected from BigNums.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel") { removing = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button("Remove", role: .destructive) {
+                    removing = nil
+                    Task { await store.remove(connection.id) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+            }
+            .controlSize(.small)
+            .padding(.top, 6)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.05)))
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var addAccountRow: some View {
+        if store.isLinking {
+            ItemRow(title: "Finish connecting in your browser") {
+                ProgressView().controlSize(.small)
+            } trailing: {
+                Button("Cancel") { store.cancelLink() }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 12))
+            }
+            .padding(.horizontal, Self.inset)
+        } else {
+            Button { store.addConnection() } label: {
+                ItemRow(title: "Add account…") {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(0.07)))
+                }
+            }
+            .buttonStyle(RowButtonStyle())
+            .disabled(!store.isConfigured)
+        }
+    }
+
+    // MARK: Empty state & footer
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("See what you spend")
+                .font(.system(size: 15, weight: .semibold))
+            Text("Connect a bank or card and your spending for today, this week, and this month will appear in the menu bar.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Group {
+                if store.isLinking {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Finish connecting in your browser").font(.system(size: 12))
+                        Button("Cancel") { store.cancelLink() }.buttonStyle(.borderless).font(.system(size: 12))
+                    }
+                } else {
+                    Button("Add account…") { store.addConnection() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!store.isConfigured)
+                }
+            }
+            .padding(.top, 8)
+        }
+        .padding(.horizontal, Self.inset)
+        .padding(.vertical, 4)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 4) {
+            Group {
+                if store.isRefreshing {
+                    Text("Updating…")
+                } else if let last = store.lastRefresh {
+                    Text("Updated \(last.formatted(.relative(presentation: .named)))")
+                }
+            }
+            Button { Task { await store.refresh() } } label: {
+                Image(systemName: "arrow.clockwise").font(.system(size: 10, weight: .semibold))
+            }
+            .disabled(store.isRefreshing || !store.isConfigured)
+            .help("Refresh now")
+            Spacer()
+            Button("Quit") { NSApplication.shared.terminate(nil) }
+                .keyboardShortcut("q")
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .buttonStyle(.borderless)
+        .padding(.horizontal, Self.inset)
     }
 
     // MARK: Period title & comparison
@@ -121,7 +415,7 @@ struct MenuView: View {
         switch (period, offset) {
         case (.day, 0): return "Today"
         case (.day, -1): return "Yesterday"
-        case (.day, _): return start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+        case (.day, _): return start.formatted(.dateTime.weekday(.wide).month(.wide).day())
         case (.week, 0): return "This week"
         case (.week, -1): return "Last week"
         case (.week, _): return "\(start.formatted(.dateTime.month(.abbreviated).day())) – \(last.formatted(.dateTime.month(.abbreviated).day()))"
@@ -153,239 +447,237 @@ struct MenuView: View {
                 end = min(cal.date(byAdding: .day, value: elapsedDays, to: previousStart) ?? end, end)
             }
             reference = store.breakdown(DateInterval(start: previousStart, end: end)).total
-            let unit = period == .week ? "week" : "month"
-            phrase = offset == 0 ? "this time last \(unit)" : "the \(unit) before"
+            phrase = offset == 0 ? "this time last \(period.unit)" : "the \(period.unit) before"
         }
         let difference = spent - reference
         if abs(difference) < 1 { return "About the same as \(phrase)" }
         return "\(Store.money(abs(difference))) \(difference > 0 ? "more" : "less") than \(phrase)"
     }
+}
 
-    // MARK: Sections
+// MARK: - Building blocks
 
-    private var emptyState: some View {
-        VStack(spacing: 6) {
-            Image(systemName: "creditcard")
-                .font(.title2)
+/// The one bold element: a light, large figure with a quieter dollar sign.
+private struct HeroAmount: View {
+    let value: Double
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 1) {
+            Text("$")
+                .font(.system(size: 26, weight: .light))
                 .foregroundStyle(.secondary)
-            Text("No Accounts").font(.headline)
-            Text("Connect a bank or card to start tracking your spending.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 16)
-    }
-
-    private func dayPurchases(_ purchases: [Transaction]) -> some View {
-        let accounts = Dictionary(store.connections.flatMap { $0.accounts ?? [] }.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        let shown = purchases.prefix(Self.maxRows)
-        return VStack(alignment: .leading, spacing: 2) {
-            if purchases.isEmpty {
-                status(offset == 0 ? "No purchases yet today" : "No purchases", color: .secondary)
-            }
-            ForEach(shown, id: \.transactionId) { txn in
-                purchaseRow(txn, account: txn.accountId.flatMap { accounts[$0] })
-            }
-            if purchases.count > shown.count {
-                status("+\(purchases.count - shown.count) more", color: .secondary)
-            }
-        }
-    }
-
-    /// Same row cap on every tab, so the menu keeps a steady height when switching periods.
-    private static let maxRows = 5
-
-    private func topMerchants(_ purchases: [Transaction], total: Double) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Top Merchants")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.top, 4)
-            if purchases.isEmpty {
-                status(offset == 0 ? "No purchases yet this \(period == .week ? "week" : "month")" : "No purchases", color: .secondary)
-            }
-            ForEach(MerchantTotal.top(purchases, limit: Self.maxRows)) { merchant in
-                HStack(spacing: 10) {
-                    MerchantIcon(logo: merchant.sample.logoUrl.flatMap(URL.init(string:)), symbol: merchant.sample.symbol)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(merchant.name).lineLimit(1)
-                        HStack(spacing: 8) {
-                            Text(merchant.count == 1 ? "1 purchase" : "\(merchant.count) purchases")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize()
-                            ShareBar(share: total > 0 ? merchant.total / total : 0)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(merchant.total.formatted(.currency(code: "USD")))
-                        .monospacedDigit()
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-            }
-        }
-    }
-
-    private func purchaseRow(_ txn: Transaction, account: Account?) -> some View {
-        let detail = [account.map { [$0.name, $0.mask.map { "••\($0)" }].compactMap { $0 }.joined(separator: " ") },
-                      txn.pending == true ? "Pending" : nil]
-            .compactMap { $0 }
-            .joined(separator: " · ")
-        return HStack(spacing: 10) {
-            MerchantIcon(logo: txn.logoUrl.flatMap(URL.init(string:)), symbol: txn.symbol)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(txn.merchantName ?? txn.name ?? "Purchase").lineLimit(1)
-                if !detail.isEmpty {
-                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-            }
-            Spacer(minLength: 8)
-            Text(txn.amount.formatted(.currency(code: "USD")))
+            Text(value.formatted(.number.precision(.fractionLength(0))))
+                .font(.system(size: 44, weight: .light))
                 .monospacedDigit()
+                .contentTransition(.numericText())
+                // Animate only the number: animating the layout makes the content resize smoothly while the
+                // menu window jumps to its new size, leaving see-through gaps at the top and bottom.
+                .animation(.snappy, value: value)
         }
-        .padding(.horizontal, 6)
+    }
+}
+
+private struct SectionTitle: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, MenuView.inset)
+            .padding(.bottom, 4)
+    }
+}
+
+private struct Note: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, MenuView.inset)
+            .padding(.vertical, 4)
+    }
+}
+
+/// The one row anatomy used everywhere: 24pt icon, name with an optional second line, and a trailing amount or control.
+private struct ItemRow<Icon: View, Detail: View, Trailing: View>: View {
+    let title: String
+    @ViewBuilder let icon: Icon
+    @ViewBuilder let detail: Detail
+    @ViewBuilder let trailing: Trailing
+
+    var body: some View {
+        HStack(spacing: 10) {
+            icon.frame(width: 24, height: 24)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+                detail
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            trailing
+        }
         .padding(.vertical, 4)
     }
+}
 
-    private func section(_ connection: Connection, _ breakdown: Breakdown) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack {
-                BankHeader(connection: connection)
-                Spacer()
-                if confirmingRemoval == connection.id {
-                    Button("Cancel") { confirmingRemoval = nil }
-                    Button("Remove", role: .destructive) {
-                        confirmingRemoval = nil
-                        Task { await store.remove(connection.id) }
-                    }
-                    .foregroundStyle(.red)
-                } else {
-                    Menu {
-                        if let website = connection.websiteURL {
-                            Button("Open Website") { NSWorkspace.shared.open(website) }
-                            Divider()
-                        }
-                        Button("Reconnect…") { store.reconnect(connection.id) }
-                            .disabled(store.isLinking)
-                        Button("Remove \(connection.institution)…", role: .destructive) { confirmingRemoval = connection.id }
-                    } label: {
-                        Image(systemName: "ellipsis")
-                    }
-                    .menuStyle(.button)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .foregroundStyle(.tertiary)
-                }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .frame(height: 18)
-            .padding(.horizontal, 6)
-            .padding(.top, 10)
+extension ItemRow where Trailing == AmountText {
+    init(title: String, amount: Double, @ViewBuilder icon: () -> Icon, @ViewBuilder detail: () -> Detail) {
+        self.init(title: title, icon: icon, detail: detail, trailing: { AmountText(value: amount) })
+    }
+}
 
-            if let error = connection.error {
-                HStack(alignment: .firstTextBaseline) {
-                    status(error, color: .red)
-                    if connection.needsReconnect {
-                        Spacer()
-                        Button("Reconnect") { store.reconnect(connection.id) }
-                            .buttonStyle(.borderless)
-                            .font(.caption.weight(.semibold))
-                            .disabled(store.isLinking)
-                            .padding(.trailing, 6)
-                    }
-                }
-            } else if connection.cursor == nil {
-                status("Waiting for transactions…", color: .secondary)
-            }
+extension ItemRow where Detail == EmptyView {
+    init(title: String, @ViewBuilder icon: () -> Icon, @ViewBuilder trailing: () -> Trailing) {
+        self.init(title: title, icon: icon, detail: { EmptyView() }, trailing: trailing)
+    }
+}
 
-            ForEach(connection.accounts ?? []) { account in
-                accountRow(account, value: breakdown.byAccount[account.id] ?? 0)
+extension ItemRow where Trailing == EmptyView {
+    init(title: String, @ViewBuilder icon: () -> Icon, @ViewBuilder detail: () -> Detail) {
+        self.init(title: title, icon: icon, detail: detail, trailing: { EmptyView() })
+    }
+}
+
+extension ItemRow where Detail == EmptyView, Trailing == EmptyView {
+    init(title: String, @ViewBuilder icon: () -> Icon) {
+        self.init(title: title, icon: icon, detail: { EmptyView() }, trailing: { EmptyView() })
+    }
+}
+
+struct AmountText: View {
+    let value: Double
+
+    var body: some View {
+        Text(value > 0 ? value.formatted(.currency(code: "USD")) : "—")
+            .font(.system(size: 13))
+            .monospacedDigit()
+            .foregroundStyle(value > 0 ? .primary : .secondary)
+    }
+}
+
+/// Merchants are circles…
+private struct MerchantIcon: View {
+    let logo: URL?
+    let symbol: String
+
+    var body: some View {
+        AsyncImage(url: logo) { image in
+            image.resizable().scaledToFill()
+        } placeholder: {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.primary.opacity(0.07))
+        }
+        .frame(width: 24, height: 24)
+        .clipShape(Circle())
+    }
+}
+
+/// …banks are rounded squares, so the two kinds of row read differently at a glance.
+private struct BankLogo: View {
+    let connection: Connection
+
+    var body: some View {
+        Group {
+            if let logo = connection.logo.flatMap({ Data(base64Encoded: $0) }).flatMap(NSImage.init(data:)) {
+                Image(nsImage: logo).resizable().scaledToFill()
+            } else {
+                Image(systemName: "building.columns.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.primary.opacity(0.07))
             }
         }
+        .frame(width: 24, height: 24)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
+}
 
-    private func status(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption)
-            .foregroundStyle(color)
-            .lineLimit(2)
-            .padding(.horizontal, 6)
-    }
+/// A merchant's share of the period's spending. Neutral, so the total stays the only emphasis.
+private struct ShareBar: View {
+    let share: Double
 
-    private func accountRow(_ account: Account, value: Double) -> some View {
-        let included = !store.excludedAccounts.contains(account.id)
-        return Button { store.toggleExcluded(account.id) } label: {
-            HStack(spacing: 10) {
-                CircleIcon(symbol: account.symbol, filled: included)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(account.name).lineLimit(1)
-                    Text(account.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 8)
-                Text(value > 0 ? Store.money(value) : "—")
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                    .foregroundStyle(included && value > 0 ? .primary : .secondary)
-            }
-            .foregroundStyle(included ? .primary : .secondary)
+    var body: some View {
+        // Fill only, no track: a track's ragged start (after "1 purchase" vs "12 purchases") reads as noise.
+        GeometryReader { geometry in
+            Capsule()
+                .fill(Color.primary.opacity(0.3))
+                .frame(width: max(3, geometry.size.width * min(share, 1)), height: 3)
+                .frame(maxHeight: .infinity)
         }
-        .buttonStyle(RowButtonStyle())
-        .help(included ? "Click to exclude from totals" : "Excluded from totals — click to include")
+        .frame(height: 3)
+        .help(share.formatted(.percent.precision(.fractionLength(0))) + " of spending")
+    }
+}
+
+/// Full-width clickable row with the rounded hover highlight macOS menus use.
+private struct RowButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Row(configuration: configuration)
     }
 
-    @ViewBuilder
-    private var addRow: some View {
-        if store.isLinking {
-            HStack(spacing: 10) {
-                ProgressView().controlSize(.small).frame(width: 26, height: 26)
-                Text("Finish in your browser…").foregroundStyle(.secondary)
-                Spacer()
-                Button("Cancel") { store.cancelLink() }
-                    .buttonStyle(.borderless)
-            }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-        } else {
-            Button { store.addConnection() } label: {
-                HStack(spacing: 10) {
-                    CircleIcon(symbol: "plus", filled: false)
-                    Text("Add Account…")
-                }
-            }
-            .buttonStyle(RowButtonStyle())
-            .disabled(!store.isConfigured)
+    private struct Row: View {
+        let configuration: Configuration
+        @State private var hovering = false
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            configuration.label
+                .padding(.horizontal, MenuView.inset)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : hovering && isEnabled ? 0.06 : 0))
+                )
+                .opacity(isEnabled ? 1 : 0.5)
+                .onHover { hovering = $0 }
         }
     }
+}
 
-    private var footer: some View {
-        HStack(spacing: 12) {
-            Group {
-                if store.isRefreshing {
-                    Text("Updating…")
-                } else if let last = store.lastRefresh {
-                    Text("Updated \(last.formatted(.relative(presentation: .named)))")
-                }
+/// Pops up a native NSMenu at the mouse, for row actions.
+@MainActor
+private enum ActionMenu {
+    enum Item {
+        case action(String, checked: Bool = false, () -> Void)
+        case divider
+    }
+
+    private final class Target: NSObject {
+        let handler: () -> Void
+        init(_ handler: @escaping () -> Void) { self.handler = handler }
+        @objc func run() { handler() }
+    }
+
+    static func show(_ items: [Item]) {
+        let menu = NSMenu()
+        for item in items {
+            switch item {
+            case .divider:
+                if menu.items.last?.isSeparatorItem == false { menu.addItem(.separator()) }
+            case let .action(title, checked, handler):
+                let target = Target(handler)
+                let menuItem = NSMenuItem(title: title, action: #selector(Target.run), keyEquivalent: "")
+                menuItem.target = target
+                menuItem.representedObject = target  // NSMenuItem holds its target weakly; this keeps it alive
+                menuItem.state = checked ? .on : .off
+                menu.addItem(menuItem)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            Spacer()
-            Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                .disabled(store.isRefreshing || !store.isConfigured)
-                .help("Refresh")
-            Button { NSApplication.shared.terminate(nil) } label: { Image(systemName: "power") }
-                .keyboardShortcut("q")
-                .help("Quit BigNums")
         }
-        .buttonStyle(.borderless)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 6)
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
     }
 }
 
@@ -428,125 +720,21 @@ private struct WindowReader: NSViewRepresentable {
     }
 }
 
-/// Round SF Symbol badge, like the macOS Wi-Fi and Bluetooth menus: accent-filled when on, gray when off.
-private struct CircleIcon: View {
-    let symbol: String
-    let filled: Bool
+// MARK: - Display helpers
 
-    var body: some View {
-        Image(systemName: symbol)
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(filled ? Color.white : Color.primary.opacity(0.6))
-            .frame(width: 26, height: 26)
-            .background(Circle().fill(filled ? Color.accentColor : Color.primary.opacity(0.1)))
-    }
-}
-
-/// Bank logo and name. Clicking opens the bank's website, where the browser fills in the saved password or passkey.
-private struct BankHeader: View {
-    let connection: Connection
-    @State private var hovering = false
-
-    var body: some View {
-        if let website = connection.websiteURL {
-            Button { NSWorkspace.shared.open(website) } label: {
-                HStack(spacing: 4) {
-                    label
-                    Image(systemName: "arrow.up.right")
-                        .font(.system(size: 8, weight: .bold))
-                        .opacity(hovering ? 1 : 0)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering = $0 }
-            .help("Open \(connection.institution) website")
-        } else {
-            label
-        }
-    }
-
-    private var label: some View {
-        HStack(spacing: 6) {
-            Group {
-                if let logo = connection.logoImage {
-                    Image(nsImage: logo).resizable()
-                } else {
-                    Image(systemName: "building.columns.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(Color.primary.opacity(0.1))
-                }
-            }
-            .frame(width: 14, height: 14)
-            .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-            Text(connection.institution)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(hovering ? .primary : .secondary)
+private extension Period {
+    var unit: String {
+        switch self {
+        case .day: "day"
+        case .week: "week"
+        case .month: "month"
         }
     }
 }
 
-/// Thin bar showing a merchant's share of the period's spending, like Screen Time's "Most Used" list.
-private struct ShareBar: View {
-    let share: Double
-
-    var body: some View {
-        Capsule()
-            .fill(Color.primary.opacity(0.08))
-            .frame(height: 4)
-            .overlay(alignment: .leading) {
-                GeometryReader { geometry in
-                    Capsule()
-                        .fill(Color.accentColor)
-                        .frame(width: max(4, geometry.size.width * min(share, 1)))
-                }
-            }
-            .help(share.formatted(.percent.precision(.fractionLength(0))) + " of spending")
-    }
-}
-
-/// Merchant logo from Plaid when available, otherwise a category symbol.
-private struct MerchantIcon: View {
-    let logo: URL?
-    let symbol: String
-
-    var body: some View {
-        AsyncImage(url: logo) { image in
-            image.resizable().scaledToFill()
-        } placeholder: {
-            CircleIcon(symbol: symbol, filled: false)
-        }
-        .frame(width: 26, height: 26)
-        .clipShape(Circle())
-    }
-}
-
-/// Full-width menu row with the rounded hover highlight macOS menus use.
-private struct RowButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        Row(configuration: configuration)
-    }
-
-    private struct Row: View {
-        let configuration: Configuration
-        @State private var hovering = false
-        @Environment(\.isEnabled) private var isEnabled
-
-        var body: some View {
-            configuration.label
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : hovering && isEnabled ? 0.07 : 0))
-                )
-                .opacity(isEnabled ? 1 : 0.5)
-                .onHover { hovering = $0 }
-        }
+private extension Store {
+    var accountsByID: [String: Account] {
+        Dictionary(connections.flatMap { $0.accounts ?? [] }.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     }
 }
 
@@ -569,25 +757,28 @@ private extension Transaction {
     }
 }
 
-private extension Connection {
-    var logoImage: NSImage? {
-        logo.flatMap { Data(base64Encoded: $0) }.flatMap(NSImage.init(data:))
-    }
-}
-
 private extension Account {
-    var symbol: String {
-        switch (type, subtype) {
-        case ("credit", _): "creditcard.fill"
-        case (_, "savings"), (_, "money market"), (_, "cd"), (_, "hsa"): "banknote.fill"
-        case ("loan", _): "house.fill"
-        case ("investment", _): "chart.line.uptrend.xyaxis"
-        default: "building.columns.fill"
+    /// Banks send messy names, e.g. "WELLS FARGO ACTIVE CASH VISA\u{FFFD}\u{FFFD} CARD ...4095": drop broken characters
+    /// and the trailing account number (shown on the second line), and soften all caps to title case.
+    var displayName: String {
+        var cleaned = name.replacingOccurrences(of: "\u{FFFD}", with: "")
+        if let trailingMask = try? Regex(#"\s*\.{2,}\s*\d+\s*$"#) {
+            cleaned = cleaned.replacing(trailingMask, with: "")
         }
+        cleaned = cleaned.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        if cleaned.isEmpty { return name }
+        return cleaned == cleaned.uppercased() && cleaned.count > 4 ? cleaned.capitalized : cleaned
     }
 
-    /// e.g. "Credit Card ••4821"
-    var detail: String {
-        [subtype?.capitalized, mask.map { "••\($0)" }].compactMap { $0 }.joined(separator: " ")
+    /// "Credit card ••4821". The bank logo beside it already says which bank.
+    var kind: String {
+        let type = (subtype ?? type ?? "account").prefix(1).uppercased() + (subtype ?? type ?? "account").dropFirst()
+        return mask.map { "\(type) ••\($0)" } ?? type
+    }
+
+    /// The card a purchase was on: its name when short ("CSP ••0586"), otherwise its kind ("credit card ••1009").
+    var shortName: String {
+        let label = displayName.count <= 16 ? displayName : (subtype ?? "account")
+        return mask.map { "\(label) ••\($0)" } ?? label
     }
 }

@@ -30,7 +30,7 @@ struct Connection: Codable, Identifiable {
 }
 
 enum Period: String, CaseIterable, Identifiable {
-    case day = "Today", week = "Week", month = "Month"
+    case day = "Day", week = "Week", month = "Month"
 
     var id: Self { self }
 
@@ -113,9 +113,11 @@ final class Store {
 
     var isConfigured: Bool { plaid != nil }
 
-    init() {
+    /// `autoRefresh: false` skips network activity (used by the debug snapshot renderer).
+    init(autoRefresh: Bool = true) {
         load()
         do { plaid = Plaid(config: try PlaidConfig.load()) } catch { message = error.localizedDescription }
+        guard autoRefresh else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
             Task { await self?.refresh() }
         }

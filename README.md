@@ -15,3 +15,7 @@ Click the menu bar item to see totals, add a connection (opens Plaid Hosted Link
 - Refreshes every 15 min and when you open the menu.
 
 Data (access tokens + recent transactions) lives in `~/Library/Application Support/BigNums/connections.json` (mode 600).
+
+## Design review
+Render the menu to a PNG without clicking the menu bar (debug builds only):
+`BIGNUMS_SNAPSHOT=menu.png BIGNUMS_PERIOD=Week swift run` (add `BIGNUMS_DARK=1` for dark mode).
