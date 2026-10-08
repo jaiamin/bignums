@@ -18,38 +18,17 @@ struct BigNumsApp: App {
     }
 }
 
-enum Period: String, CaseIterable, Identifiable {
-    case day = "Today", week = "Week", month = "Month"
-
-    var id: Self { self }
-
-    var caption: String {
-        switch self {
-        case .day: "Spent today"
-        case .week: "Spent this week"
-        case .month: "Spent this month"
-        }
-    }
-
-    func value(_ totals: Totals?) -> Double {
-        guard let totals else { return 0 }
-        switch self {
-        case .day: return totals.day
-        case .week: return totals.week
-        case .month: return totals.month
-        }
-    }
-}
-
 struct MenuView: View {
     let store: Store
     @AppStorage("period") private var period: Period = .month
+    @State private var offset = 0  // 0 = current period, -1 = previous, ...
     @State private var confirmingRemoval: String?
     @State private var window: NSWindow?
     @State private var contentHeight: CGFloat = 0
 
     var body: some View {
-        let breakdown = store.breakdown
+        let interval = period.interval(offset: offset, from: store.referenceDate)
+        let breakdown = store.breakdown(interval)
         VStack(alignment: .leading, spacing: 0) {
             Picker("Period", selection: $period) {
                 ForEach(Period.allCases) { Text($0.rawValue).tag($0) }
@@ -58,15 +37,29 @@ struct MenuView: View {
             .labelsHidden()
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(Store.money(period.value(breakdown.total)))
+                Text(Store.money(breakdown.total))
                     .font(.system(size: 34, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     // Animate only the number: animating the layout makes the content resize smoothly while the
                     // menu window jumps to its new size, leaving see-through gaps at the top and bottom.
-                    .animation(.snappy, value: period)
-                Text(period.caption)
-                    .font(.callout)
+                    .animation(.snappy, value: interval)
+                HStack(spacing: 2) {
+                    Text(title(interval))
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button { offset -= 1 } label: { Image(systemName: "chevron.left").frame(width: 22, height: 20) }
+                        .disabled(!(store.historyStart.map { interval.start > $0 } ?? false))
+                        .help("Previous")
+                    Button { offset += 1 } label: { Image(systemName: "chevron.right").frame(width: 22, height: 20) }
+                        .disabled(offset >= 0)
+                        .help("Next")
+                }
+                .buttonStyle(.borderless)
+                // Always reserve the line so the menu doesn't change height when there's nothing to compare.
+                Text(comparison(interval, spent: breakdown.total) ?? " ")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 6)
@@ -77,9 +70,9 @@ struct MenuView: View {
                 emptyState
             } else {
                 if period == .day {
-                    todayPurchases(breakdown.today)
+                    dayPurchases(breakdown.purchases)
                 } else {
-                    topMerchants(period == .week ? breakdown.week : breakdown.month, total: period.value(breakdown.total))
+                    topMerchants(breakdown.purchases, total: breakdown.total)
                 }
                 Divider().padding(.top, 8).padding(.bottom, 2)
             }
@@ -113,6 +106,59 @@ struct MenuView: View {
             fitWindow(found, to: contentHeight)
         })
         .task { await store.refreshIfStale() }
+        .onChange(of: period) { offset = 0 }
+        // Closing the menu returns it to the current period, so it never reopens on old numbers.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { note in
+            if note.object as? NSWindow === window { offset = 0 }
+        }
+    }
+
+    // MARK: Period title & comparison
+
+    private func title(_ interval: DateInterval) -> String {
+        let start = interval.start
+        let last = interval.end.addingTimeInterval(-1)
+        switch (period, offset) {
+        case (.day, 0): return "Today"
+        case (.day, -1): return "Yesterday"
+        case (.day, _): return start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+        case (.week, 0): return "This week"
+        case (.week, -1): return "Last week"
+        case (.week, _): return "\(start.formatted(.dateTime.month(.abbreviated).day())) – \(last.formatted(.dateTime.month(.abbreviated).day()))"
+        case (.month, 0): return "This month"
+        case (.month, _):
+            let sameYear = Calendar.current.isDate(start, equalTo: store.referenceDate, toGranularity: .year)
+            return sameYear ? start.formatted(.dateTime.month(.wide)) : start.formatted(.dateTime.month(.wide).year())
+        }
+    }
+
+    /// One line of context: a day vs. the average day before it; a running week/month vs. the previous one up to the
+    /// same point (Oct 1–7 vs. Sep 1–7); a finished week/month vs. the whole one before it.
+    private func comparison(_ interval: DateInterval, spent: Double) -> String? {
+        let cal = Calendar.current
+        guard let historyStart = store.historyStart else { return nil }
+        let reference: Double
+        let phrase: String
+        if period == .day {
+            // 28 days = 4 full weeks, so weekends and weekdays weigh equally.
+            guard let start = cal.date(byAdding: .day, value: -28, to: interval.start), start >= historyStart else { return nil }
+            reference = store.breakdown(DateInterval(start: start, end: interval.start)).total / 28
+            phrase = "your daily average"
+        } else {
+            guard let previousStart = cal.date(byAdding: period.component, value: -1, to: interval.start),
+                  previousStart >= historyStart else { return nil }
+            var end = interval.start
+            if offset == 0 {
+                let elapsedDays = (cal.dateComponents([.day], from: interval.start, to: cal.startOfDay(for: store.referenceDate)).day ?? 0) + 1
+                end = min(cal.date(byAdding: .day, value: elapsedDays, to: previousStart) ?? end, end)
+            }
+            reference = store.breakdown(DateInterval(start: previousStart, end: end)).total
+            let unit = period == .week ? "week" : "month"
+            phrase = offset == 0 ? "this time last \(unit)" : "the \(unit) before"
+        }
+        let difference = spent - reference
+        if abs(difference) < 1 { return "About the same as \(phrase)" }
+        return "\(Store.money(abs(difference))) \(difference > 0 ? "more" : "less") than \(phrase)"
     }
 
     // MARK: Sections
@@ -132,12 +178,12 @@ struct MenuView: View {
         .padding(.vertical, 16)
     }
 
-    private func todayPurchases(_ purchases: [Transaction]) -> some View {
+    private func dayPurchases(_ purchases: [Transaction]) -> some View {
         let accounts = Dictionary(store.connections.flatMap { $0.accounts ?? [] }.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let shown = purchases.prefix(Self.maxRows)
         return VStack(alignment: .leading, spacing: 2) {
             if purchases.isEmpty {
-                status("No purchases yet today", color: .secondary)
+                status(offset == 0 ? "No purchases yet today" : "No purchases", color: .secondary)
             }
             ForEach(shown, id: \.transactionId) { txn in
                 purchaseRow(txn, account: txn.accountId.flatMap { accounts[$0] })
@@ -159,7 +205,7 @@ struct MenuView: View {
                 .padding(.horizontal, 6)
                 .padding(.top, 4)
             if purchases.isEmpty {
-                status(period == .week ? "No purchases yet this week" : "No purchases yet this month", color: .secondary)
+                status(offset == 0 ? "No purchases yet this \(period == .week ? "week" : "month")" : "No purchases", color: .secondary)
             }
             ForEach(MerchantTotal.top(purchases, limit: Self.maxRows)) { merchant in
                 HStack(spacing: 10) {
@@ -258,7 +304,7 @@ struct MenuView: View {
             }
 
             ForEach(connection.accounts ?? []) { account in
-                accountRow(account, value: period.value(breakdown.byAccount[account.id]))
+                accountRow(account, value: breakdown.byAccount[account.id] ?? 0)
             }
         }
     }

@@ -100,6 +100,7 @@ struct Plaid {
             body["access_token"] = accessToken  // update mode must not list products
         } else {
             body["products"] = ["transactions"]
+            body["transactions"] = ["days_requested": 730]  // max history, for browsing past months
         }
         let r: Response = try await call("/link/token/create", body)
         guard let url = r.hostedLinkUrl.flatMap(URL.init(string:)) else {

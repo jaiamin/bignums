@@ -29,20 +29,32 @@ struct Connection: Codable, Identifiable {
     }
 }
 
-struct Totals {
-    var day = 0.0, week = 0.0, month = 0.0
+enum Period: String, CaseIterable, Identifiable {
+    case day = "Today", week = "Week", month = "Month"
 
-    static func += (lhs: inout Totals, rhs: Totals) {
-        lhs.day += rhs.day; lhs.week += rhs.week; lhs.month += rhs.month
+    var id: Self { self }
+
+    var component: Calendar.Component {
+        switch self {
+        case .day: .day
+        case .week: .weekOfYear
+        case .month: .month
+        }
+    }
+
+    /// The calendar day/week/month `offset` periods away from the one containing `date` (0 = current, -1 = previous).
+    func interval(offset: Int, from date: Date) -> DateInterval {
+        let cal = Calendar.current
+        let shifted = cal.date(byAdding: component, value: offset, to: date) ?? date
+        return cal.dateInterval(of: component, for: shifted) ?? DateInterval(start: shifted, duration: 86400)
     }
 }
 
+/// Counted spending inside one date range.
 struct Breakdown {
-    var total = Totals()
-    var byAccount: [String: Totals] = [:]
-    var today: [Transaction] = []  // counted purchases from today, biggest first
-    var week: [Transaction] = []  // counted purchases this week / month, unordered
-    var month: [Transaction] = []
+    var total = 0.0
+    var byAccount: [String: Double] = [:]  // includes excluded accounts, so their rows still show a number
+    var purchases: [Transaction] = []  // biggest first; excluded accounts left out
 }
 
 struct MerchantTotal: Identifiable {
@@ -119,31 +131,29 @@ final class Store {
 
     // MARK: Totals
 
-    var breakdown: Breakdown {
-        let now = lastRefresh ?? Date()
-        let cal = Calendar.current
-        let day = cal.startOfDay(for: now)
-        let week = cal.dateInterval(of: .weekOfYear, for: now)?.start ?? day
-        let month = cal.dateInterval(of: .month, for: now)?.start ?? day
+    /// "Now" for all period math. Moves forward on every refresh, which also rolls the day/week/month over.
+    var referenceDate: Date { lastRefresh ?? Date() }
 
+    /// Earliest day we hold any transaction for; bounds browsing back and comparisons.
+    var historyStart: Date? {
+        connections.flatMap(\.transactions.values).map(\.date).min().flatMap(Self.dayFormatter.date(from:))
+    }
+
+    func breakdown(_ interval: DateInterval) -> Breakdown {
+        let now = referenceDate
         var result = Breakdown()
         for txn in connections.flatMap(\.transactions.values) where txn.amount > 0 {
             if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
-            guard let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date), date <= now else { continue }
-            var t = Totals()
-            if date >= day { t.day = txn.amount }
-            if date >= week { t.week = txn.amount }
-            if date >= month { t.month = txn.amount }
+            guard let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date),
+                  interval.start <= date, date < interval.end, date <= now else { continue }
             if let accountID = txn.accountId {
-                result.byAccount[accountID, default: Totals()] += t
+                result.byAccount[accountID, default: 0] += txn.amount
                 if excludedAccounts.contains(accountID) { continue }
             }
-            result.total += t
-            if t.day > 0 { result.today.append(txn) }
-            if t.week > 0 { result.week.append(txn) }
-            if t.month > 0 { result.month.append(txn) }
+            result.total += txn.amount
+            result.purchases.append(txn)
         }
-        result.today.sort { $0.amount > $1.amount }
+        result.purchases.sort { $0.amount > $1.amount }
         return result
     }
 
@@ -151,9 +161,11 @@ final class Store {
         if excludedAccounts.contains(accountID) { excludedAccounts.remove(accountID) } else { excludedAccounts.insert(accountID) }
     }
 
+    /// Menu bar text: always the current day, week and month, whatever the menu is browsing.
     var label: String {
-        let t = breakdown.total
-        return [t.day, t.week, t.month].map(Self.money).joined(separator: " | ")
+        Period.allCases
+            .map { Self.money(breakdown($0.interval(offset: 0, from: referenceDate)).total) }
+            .joined(separator: " | ")
     }
 
     static func money(_ value: Double) -> String {
@@ -183,8 +195,8 @@ final class Store {
             for txnID in result.removed { connections[i].transactions[txnID] = nil }
             if let accounts = result.accounts { connections[i].accounts = accounts }
             if !result.cursor.isEmpty { connections[i].cursor = result.cursor }  // empty = data not ready yet
-            // Keep ~2 months so the file stays small; only the current month is ever displayed.
-            let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-62 * 86400))
+            // Keep up to 2 years for browsing past periods (the most Plaid provides).
+            let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-730 * 86400))
             connections[i].transactions = connections[i].transactions.filter { $0.value.date >= cutoff }
             // Fetch the account list if we've never received one (or saved it before account types were stored).
             if connections[i].accounts.map({ $0.isEmpty || $0.contains { $0.type == nil } }) ?? true, let accounts = try? await plaid.accounts(accessToken: connection.accessToken),
