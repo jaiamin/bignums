@@ -29,6 +29,7 @@ struct MenuView: View {
     let store: Store
     @AppStorage("period") private var period: Period = .month
     @AppStorage("accountsExpanded") private var accountsExpanded = false
+    @AppStorage("recurringExpanded") private var recurringExpanded = false
     @State private var offset = 0  // 0 = current period, -1 = previous, ...
     @State private var removing: String?  // connection awaiting remove confirmation
     @State private var window: NSWindow?
@@ -49,8 +50,10 @@ struct MenuView: View {
                     .padding(.top, 18)
                 spending(breakdown)
                     .padding(.top, 22)
+                recurringSection
+                    .padding(.top, 18)
                 accounts(breakdown)
-                    .padding(.top, 22)
+                    .padding(.top, 4)
             }
 
             if let message = store.message {
@@ -131,6 +134,13 @@ struct MenuView: View {
             Text(comparison(interval, spent: breakdown.total) ?? " ")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
+            if period != .day, let projected = store.projection(for: interval) {
+                let lastDay = interval.end.addingTimeInterval(-1)
+                let by = period == .week ? lastDay.formatted(.dateTime.weekday(.wide)) : lastDay.formatted(.dateTime.month(.abbreviated).day())
+                Text("On pace for \(Store.money(projected)) by \(by)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, Self.inset)
     }
@@ -157,21 +167,53 @@ struct MenuView: View {
                     merchantRow(merchant, share: breakdown.total > 0 ? merchant.total / breakdown.total : 0)
                 }
             }
+            hiddenNote
         }
+    }
+
+    /// "Ysi Inc. is hidden": the way back for hidden merchants, only shown when there are some.
+    @ViewBuilder
+    private var hiddenNote: some View {
+        let hidden = store.hiddenMerchants.sorted()
+        if !hidden.isEmpty {
+            Button {
+                var items = hidden.map { name in ActionMenu.Item.action("Show \(name)") { store.unhide(name) } }
+                if hidden.count > 1 { items += [.divider, .action("Show all") { store.unhideAll() }] }
+                ActionMenu.show(items)
+            } label: {
+                Text(hidden.count == 1 ? "\(hidden[0]) is hidden" : "\(hidden.count) merchants are hidden")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            }
+            .buttonStyle(RowButtonStyle())
+            .help("Hidden merchants aren't counted anywhere. Click to show them again.")
+        }
+    }
+
+    private func hideMenu(_ merchant: String) {
+        ActionMenu.show([.action("Hide \(merchant)") { store.hide(merchant) }])
     }
 
     private func purchaseRow(_ txn: Transaction, account: Account?) -> some View {
         let card = account?.shortName
         let detail = txn.pending == true ? card.map { "Pending on \($0)" } ?? "Pending" : card
-        return ItemRow(title: txn.merchantName ?? txn.name ?? "Purchase", amount: txn.amount) {
-            MerchantIcon(logo: txn.logoUrl.flatMap(URL.init(string:)), symbol: txn.symbol)
-        } detail: {
-            if let detail { Text(detail) }
+        return Button { hideMenu(txn.merchant) } label: {
+            ItemRow(title: txn.merchant, amount: txn.amount) {
+                MerchantIcon(logo: txn.logoUrl.flatMap(URL.init(string:)), symbol: txn.symbol)
+            } detail: {
+                if let detail { Text(detail) }
+            }
         }
-        .padding(.horizontal, Self.inset)
+        .buttonStyle(RowButtonStyle())
     }
 
     private func merchantRow(_ merchant: MerchantTotal, share: Double) -> some View {
+        Button { hideMenu(merchant.name) } label: { merchantRowContent(merchant, share: share) }
+            .buttonStyle(RowButtonStyle())
+    }
+
+    private func merchantRowContent(_ merchant: MerchantTotal, share: Double) -> some View {
         ItemRow(title: merchant.name, amount: merchant.total) {
             MerchantIcon(logo: merchant.sample.logoUrl.flatMap(URL.init(string:)), symbol: merchant.sample.symbol)
         } detail: {
@@ -181,7 +223,46 @@ struct MenuView: View {
                 ShareBar(share: share)
             }
         }
-        .padding(.horizontal, Self.inset)
+    }
+
+    // MARK: Recurring
+
+    @ViewBuilder
+    private var recurringSection: some View {
+        let items = store.recurring
+        if !items.isEmpty {
+            let increase = items.first { ($0.change ?? 0) > 0 }
+            VStack(alignment: .leading, spacing: 0) {
+                CollapsibleHeader(
+                    title: "Recurring",
+                    value: "\(Store.money(items.reduce(0) { $0 + $1.monthlyCost }))/mo",
+                    alert: increase.map { "\($0.name) went up \(($0.change ?? 0).formatted(.currency(code: "USD")))" },
+                    alertColor: .orange,
+                    expanded: $recurringExpanded
+                )
+                if recurringExpanded {
+                    ForEach(items) { recurringRow($0) }
+                }
+            }
+        }
+    }
+
+    private func recurringRow(_ item: Recurring) -> some View {
+        let next = item.next.formatted(.dateTime.month(.abbreviated).day())
+        return Button { hideMenu(item.name) } label: {
+            ItemRow(title: item.name, amount: item.amount) {
+                MerchantIcon(logo: item.sample.logoUrl.flatMap(URL.init(string:)), symbol: item.sample.symbol)
+            } detail: {
+                if let change = item.change, change > 0 {
+                    Text("Went up \(change.formatted(.currency(code: "USD"))), next \(next)").foregroundStyle(.orange)
+                } else if let change = item.change {
+                    Text("Went down \((-change).formatted(.currency(code: "USD"))), next \(next)")
+                } else {
+                    Text("\(item.cadence.label), next \(next)")
+                }
+            }
+        }
+        .buttonStyle(RowButtonStyle())
     }
 
     // MARK: Accounts
@@ -195,7 +276,7 @@ struct MenuView: View {
         }
     }
 
-    /// Collapsible header. While collapsed it still surfaces problems, so a broken bank can't go unnoticed.
+    /// While collapsed it still surfaces problems, so a broken bank can't go unnoticed.
     private var accountsHeader: some View {
         let count = store.connections.reduce(0) { $0 + max($1.accounts?.count ?? 0, 1) }
         let problem: String? = store.connections.lazy.compactMap { connection -> String? in
@@ -203,32 +284,7 @@ struct MenuView: View {
             if connection.error != nil { return "\(connection.institution) can't update" }
             return nil
         }.first
-        return Button { accountsExpanded.toggle() } label: {
-            HStack(spacing: 6) {
-                Text("Accounts")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let problem, !accountsExpanded {
-                    Text(problem)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.red)
-                        .lineLimit(1)
-                } else {
-                    Text("\(count)")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                Image(systemName: accountsExpanded ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 12)
-            }
-            .padding(.vertical, 4)
-        }
-        .buttonStyle(RowButtonStyle())
-        .help(accountsExpanded ? "Hide accounts" : "Show accounts")
+        return CollapsibleHeader(title: "Accounts", value: "\(count)", alert: problem, alertColor: .red, expanded: $accountsExpanded)
     }
 
     private func accountList(_ breakdown: Breakdown) -> some View {
@@ -474,6 +530,44 @@ private struct HeroAmount: View {
                 // menu window jumps to its new size, leaving see-through gaps at the top and bottom.
                 .animation(.snappy, value: value)
         }
+    }
+}
+
+/// Section title that opens and closes its section. While closed, an alert (if any) replaces the summary value.
+private struct CollapsibleHeader: View {
+    let title: String
+    let value: String
+    let alert: String?
+    let alertColor: Color
+    @Binding var expanded: Bool
+
+    var body: some View {
+        Button { expanded.toggle() } label: {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let alert, !expanded {
+                    Text(alert)
+                        .font(.system(size: 11))
+                        .foregroundStyle(alertColor)
+                        .lineLimit(1)
+                } else {
+                    Text(value)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 12)
+            }
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(RowButtonStyle())
+        .help(expanded ? "Hide \(title.lowercased())" : "Show \(title.lowercased())")
     }
 }
 

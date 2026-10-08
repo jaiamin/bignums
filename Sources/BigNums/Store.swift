@@ -68,12 +68,66 @@ struct MerchantTotal: Identifiable {
     static func top(_ purchases: [Transaction], limit: Int) -> [MerchantTotal] {
         var groups: [String: MerchantTotal] = [:]
         for txn in purchases {
-            let name = txn.merchantName ?? txn.name ?? "Other"
-            groups[name.lowercased(), default: MerchantTotal(name: name, total: 0, count: 0, sample: txn)].total += txn.amount
-            groups[name.lowercased()]!.count += 1
+            let key = txn.merchant.lowercased()
+            groups[key, default: MerchantTotal(name: txn.merchant, total: 0, count: 0, sample: txn)].total += txn.amount
+            groups[key]!.count += 1
         }
         return Array(groups.values.sorted { $0.total > $1.total }.prefix(limit))
     }
+}
+
+/// A charge that repeats on a steady schedule: a subscription or a bill.
+struct Recurring: Identifiable {
+    enum Cadence: CaseIterable {
+        case weekly, biweekly, monthly
+
+        /// Gaps between charges, in days, that count as this cadence (billing dates drift a few days).
+        var days: ClosedRange<Int> {
+            switch self {
+            case .weekly: 6...8
+            case .biweekly: 13...16
+            case .monthly: 26...35
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .weekly: "Weekly"
+            case .biweekly: "Every 2 weeks"
+            case .monthly: "Monthly"
+            }
+        }
+
+        func advance(_ date: Date) -> Date {
+            let cal = Calendar.current
+            switch self {
+            case .weekly: return cal.date(byAdding: .day, value: 7, to: date) ?? date
+            case .biweekly: return cal.date(byAdding: .day, value: 14, to: date) ?? date
+            case .monthly: return cal.date(byAdding: .month, value: 1, to: date) ?? date
+            }
+        }
+    }
+
+    let name: String
+    let amount: Double  // latest charge
+    let cadence: Cadence
+    let next: Date
+    let change: Double?  // latest charge minus the one before, when the price moved
+    let sample: Transaction  // supplies the logo and category icon
+    var id: String { "\(name.lowercased())-\(amount)" }
+
+    var monthlyCost: Double {
+        switch cadence {
+        case .weekly: amount * 52 / 12
+        case .biweekly: amount * 26 / 12
+        case .monthly: amount
+        }
+    }
+}
+
+extension Transaction {
+    /// The name purchases are grouped and hidden by.
+    var merchant: String { merchantName ?? name ?? "Other" }
 }
 
 @MainActor @Observable
@@ -87,6 +141,11 @@ final class Store {
     private(set) var excludedAccounts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "excludedAccounts") ?? []) {
         didSet { UserDefaults.standard.set(Array(excludedAccounts), forKey: "excludedAccounts") }
     }
+    /// Merchants left out of every total (e.g. rent, which dwarfs everything else). Stored in UserDefaults.
+    private(set) var hiddenMerchants: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "hiddenMerchants") ?? []) {
+        didSet { UserDefaults.standard.set(Array(hiddenMerchants), forKey: "hiddenMerchants") }
+    }
+    private var hiddenKeys: Set<String> { Set(hiddenMerchants.map { $0.lowercased() }) }
 
     private var plaid: Plaid?
     private var linkTask: Task<Void, Never>?
@@ -143,9 +202,11 @@ final class Store {
 
     func breakdown(_ interval: DateInterval) -> Breakdown {
         let now = referenceDate
+        let hidden = hiddenKeys
         var result = Breakdown()
         for txn in connections.flatMap(\.transactions.values) where txn.amount > 0 {
             if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
+            if hidden.contains(txn.merchant.lowercased()) { continue }
             guard let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date),
                   interval.start <= date, date < interval.end, date <= now else { continue }
             if let accountID = txn.accountId {
@@ -162,6 +223,93 @@ final class Store {
     func toggleExcluded(_ accountID: String) {
         if excludedAccounts.contains(accountID) { excludedAccounts.remove(accountID) } else { excludedAccounts.insert(accountID) }
     }
+
+    func hide(_ merchant: String) { hiddenMerchants.insert(merchant) }
+    func unhide(_ merchant: String) { hiddenMerchants.remove(merchant) }
+    func unhideAll() { hiddenMerchants.removeAll() }
+
+    // MARK: Recurring & projection
+
+    /// Charges that repeat at a steady interval with a steady price, still active, soonest first.
+    /// Respects hidden merchants and excluded accounts, like every other number.
+    var recurring: [Recurring] {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: referenceDate)
+        let hidden = hiddenKeys
+        var byMerchant: [String: [(date: Date, txn: Transaction)]] = [:]
+        for txn in connections.flatMap(\.transactions.values) where txn.amount > 0 && txn.pending != true {
+            if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
+            if let accountID = txn.accountId, excludedAccounts.contains(accountID) { continue }
+            let key = txn.merchant.lowercased()
+            guard !hidden.contains(key), let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date) else { continue }
+            byMerchant[key, default: []].append((date, txn))
+        }
+
+        var result: [Recurring] = []
+        for charges in byMerchant.values {
+            // One merchant can bill several subscriptions (Apple: iCloud and Music), so split by similar amounts.
+            var clusters: [[(date: Date, txn: Transaction)]] = []
+            for charge in charges.sorted(by: { $0.txn.amount < $1.txn.amount }) {
+                if let last = clusters.last?.last, charge.txn.amount <= last.txn.amount * 1.1 + 0.01 {
+                    clusters[clusters.count - 1].append(charge)
+                } else {
+                    clusters.append([charge])
+                }
+            }
+            for cluster in clusters where cluster.count >= 2 {
+                let sorted = cluster.sorted { $0.date < $1.date }
+                let gaps = zip(sorted, sorted.dropFirst()).map { cal.dateComponents([.day], from: $0.date, to: $1.date).day ?? 0 }
+                guard let cadence = Recurring.Cadence.allCases.first(where: { c in gaps.allSatisfy(c.days.contains) }) else { continue }
+                let amounts = sorted.map(\.txn.amount)
+                // Two charges are thin evidence (two similar takeout orders a month apart): only trust exact monthly prices.
+                if sorted.count == 2, cadence != .monthly || abs(amounts[0] - amounts[1]) > 0.01 * amounts[1] { continue }
+                let last = sorted[sorted.count - 1]
+                // Missed its slot by half a cycle or more: cancelled.
+                let sinceLast = cal.dateComponents([.day], from: last.date, to: today).day ?? 0
+                guard sinceLast <= cadence.days.upperBound * 3 / 2 else { continue }
+                var next = cadence.advance(last.date)
+                while next < today { next = cadence.advance(next) }
+                let change = amounts[amounts.count - 1] - amounts[amounts.count - 2]
+                result.append(Recurring(name: last.txn.merchant, amount: last.txn.amount, cadence: cadence, next: next,
+                                        change: abs(change) >= 0.5 ? change : nil, sample: last.txn))
+            }
+        }
+        return result.sorted { $0.next < $1.next }
+    }
+
+    /// Where a running week or month is heading: what's spent so far, plus typical day-to-day spending for the days
+    /// left, plus recurring charges due before it ends. Nil for finished periods or without 4 weeks of history.
+    func projection(for interval: DateInterval) -> Double? {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: referenceDate)
+        guard interval.contains(today), let tomorrow = cal.date(byAdding: .day, value: 1, to: today),
+              let windowStart = cal.date(byAdding: .day, value: -28, to: tomorrow),
+              let historyStart, windowStart >= historyStart else { return nil }
+        let remainingDays = cal.dateComponents([.day], from: tomorrow, to: interval.end).day ?? 0
+        guard remainingDays > 0 else { return nil }
+
+        let recurring = recurring
+        let recurringKeys = Set(recurring.map { $0.name.lowercased() })
+        // Everyday spending leaves out recurring charges (added separately below) and one-off big purchases.
+        func everyday(_ range: DateInterval) -> Double {
+            breakdown(range).purchases
+                .filter { !recurringKeys.contains($0.merchant.lowercased()) && $0.amount < Self.oneOffThreshold }
+                .reduce(0) { $0 + $1.amount }
+        }
+        // Daily rate: the last 4 weeks at first, shifting to this period's own pace over its first 14 days, so an
+        // unusually heavy (or light) last month doesn't dominate once this one has shown its own pattern.
+        let elapsedDays = Double(cal.dateComponents([.day], from: interval.start, to: tomorrow).day ?? 1)
+        let recentRate = everyday(DateInterval(start: windowStart, end: tomorrow)) / 28
+        let periodRate = everyday(DateInterval(start: interval.start, end: tomorrow)) / elapsedDays
+        let trust = min(elapsedDays / 14, 1)
+        let rate = trust * periodRate + (1 - trust) * recentRate
+
+        let upcoming = recurring.filter { $0.next >= tomorrow && $0.next < interval.end }.reduce(0) { $0 + $1.amount }
+        return breakdown(interval).total + rate * Double(remainingDays) + upcoming
+    }
+
+    /// Purchases this big (a flight, a laptop) are treated as one-offs, not part of a typical day.
+    private static let oneOffThreshold = 500.0
 
     /// Menu bar text: always the current day, week and month, whatever the menu is browsing.
     var label: String {
