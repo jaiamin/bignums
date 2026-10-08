@@ -55,6 +55,7 @@ struct Breakdown {
     var total = 0.0
     var byAccount: [String: Double] = [:]  // includes excluded accounts, so their rows still show a number
     var purchases: [Transaction] = []  // biggest first; excluded accounts left out
+    var uncounted: [String: Double] = [:]  // spending by merchants that aren't counted, in this range only
 }
 
 struct MerchantTotal: Identifiable {
@@ -211,12 +212,16 @@ final class Store {
         var result = Breakdown()
         for txn in connections.flatMap(\.transactions.values) where txn.amount > 0 {
             if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
-            if hidden.contains(txn.merchant.lowercased()) { continue }
             guard let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date),
                   interval.start <= date, date < interval.end, date <= now else { continue }
+            let isHidden = hidden.contains(txn.merchant.lowercased())
             if let accountID = txn.accountId {
-                result.byAccount[accountID, default: 0] += txn.amount
+                if !isHidden { result.byAccount[accountID, default: 0] += txn.amount }
                 if excludedAccounts.contains(accountID) { continue }
+            }
+            if isHidden {
+                result.uncounted[txn.merchant, default: 0] += txn.amount
+                continue
             }
             result.total += txn.amount
             result.purchases.append(txn)
@@ -230,8 +235,7 @@ final class Store {
     }
 
     func hide(_ merchant: String) { hiddenMerchants.insert(merchant) }
-    func unhide(_ merchant: String) { hiddenMerchants.remove(merchant) }
-    func unhideAll() { hiddenMerchants.removeAll() }
+    func unhide(_ merchant: String) { hiddenMerchants = hiddenMerchants.filter { $0.lowercased() != merchant.lowercased() } }
     func isCounted(_ merchant: String) -> Bool { !hiddenKeys.contains(merchant.lowercased()) }
 
     func dismissRecurring(_ merchant: String) { dismissedRecurring.insert(merchant) }

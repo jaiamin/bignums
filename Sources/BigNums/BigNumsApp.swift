@@ -160,34 +160,44 @@ struct MenuView: View {
                     merchantRow(merchant, share: breakdown.total > 0 ? merchant.total / breakdown.total : 0)
                 }
             }
-            hiddenNote
+            uncountedNote(breakdown.uncounted)
         }
     }
 
-    /// "Ysi Inc. isn't counted": the way back for merchants left out of totals, only shown when there are some.
+    /// "Ysi Inc. isn't counted  $2,095.03": what's missing from this period's total, and the way to count it again.
+    /// Only shown when a merchant that isn't counted actually charged you in the selected period.
     @ViewBuilder
-    private var hiddenNote: some View {
-        let hidden = store.hiddenMerchants.sorted()
-        if !hidden.isEmpty {
-            restoreNote(hidden.count == 1 ? "\(hidden[0]) isn't counted" : "\(hidden.count) merchants aren't counted",
-                        help: "Left out of your spending totals. Click to count them again.",
-                        names: hidden, itemTitle: { "Count \($0) again" }, allTitle: "Count all again",
-                        restore: store.unhide, restoreAll: store.unhideAll)
+    private func uncountedNote(_ uncounted: [String: Double]) -> some View {
+        let names = uncounted.keys.sorted { uncounted[$0]! > uncounted[$1]! }
+        if !names.isEmpty {
+            restoreNote(names.count == 1 ? "\(names[0]) isn't counted" : "\(names.count) merchants aren't counted",
+                        amount: uncounted.values.reduce(0, +),
+                        help: "Left out of this total. Click to count it again.",
+                        names: names, itemTitle: { "Count \($0) again" }, allTitle: "Count all again",
+                        restore: store.unhide, restoreAll: { names.forEach(store.unhide) })
         }
     }
 
     /// Quiet clickable line that lists what was set aside, each with a way to bring it back.
-    private func restoreNote(_ text: String, help: String, names: [String], itemTitle: @escaping (String) -> String,
+    private func restoreNote(_ text: String, amount: Double? = nil, help: String, names: [String], itemTitle: @escaping (String) -> String,
                              allTitle: String, restore: @escaping (String) -> Void, restoreAll: @escaping () -> Void) -> some View {
         Button {
             var items = names.map { name in ActionMenu.Item.action(itemTitle(name)) { restore(name) } }
             if names.count > 1 { items += [.divider, .action(allTitle) { restoreAll() }] }
             ActionMenu.show(items)
         } label: {
-            Text(text)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .padding(.vertical, 4)
+            HStack {
+                Text(text)
+                    .font(.system(size: 12))
+                Spacer()
+                if let amount {
+                    Text(amount.formatted(.currency(code: "USD")))
+                        .font(.system(size: 13))
+                        .monospacedDigit()
+                }
+            }
+            .foregroundStyle(.secondary)
+            .padding(.vertical, 4)
         }
         .buttonStyle(RowButtonStyle())
         .help(help)
