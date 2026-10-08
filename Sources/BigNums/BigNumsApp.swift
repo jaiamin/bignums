@@ -134,13 +134,6 @@ struct MenuView: View {
             Text(comparison(interval, spent: breakdown.total) ?? " ")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
-            if period != .day, let projected = store.projection(for: interval) {
-                let lastDay = interval.end.addingTimeInterval(-1)
-                let by = period == .week ? lastDay.formatted(.dateTime.weekday(.wide)) : lastDay.formatted(.dateTime.month(.abbreviated).day())
-                Text("On pace for \(Store.money(projected)) by \(by)")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            }
         }
         .padding(.horizontal, Self.inset)
     }
@@ -171,34 +164,43 @@ struct MenuView: View {
         }
     }
 
-    /// "Ysi Inc. is hidden": the way back for hidden merchants, only shown when there are some.
+    /// "Ysi Inc. isn't counted": the way back for merchants left out of totals, only shown when there are some.
     @ViewBuilder
     private var hiddenNote: some View {
         let hidden = store.hiddenMerchants.sorted()
         if !hidden.isEmpty {
-            Button {
-                var items = hidden.map { name in ActionMenu.Item.action("Show \(name)") { store.unhide(name) } }
-                if hidden.count > 1 { items += [.divider, .action("Show all") { store.unhideAll() }] }
-                ActionMenu.show(items)
-            } label: {
-                Text(hidden.count == 1 ? "\(hidden[0]) is hidden" : "\(hidden.count) merchants are hidden")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .padding(.vertical, 4)
-            }
-            .buttonStyle(RowButtonStyle())
-            .help("Hidden merchants aren't counted anywhere. Click to show them again.")
+            restoreNote(hidden.count == 1 ? "\(hidden[0]) isn't counted" : "\(hidden.count) merchants aren't counted",
+                        help: "Left out of your spending totals. Click to count them again.",
+                        names: hidden, itemTitle: { "Count \($0) again" }, allTitle: "Count all again",
+                        restore: store.unhide, restoreAll: store.unhideAll)
         }
     }
 
-    private func hideMenu(_ merchant: String) {
-        ActionMenu.show([.action("Hide \(merchant)") { store.hide(merchant) }])
+    /// Quiet clickable line that lists what was set aside, each with a way to bring it back.
+    private func restoreNote(_ text: String, help: String, names: [String], itemTitle: @escaping (String) -> String,
+                             allTitle: String, restore: @escaping (String) -> Void, restoreAll: @escaping () -> Void) -> some View {
+        Button {
+            var items = names.map { name in ActionMenu.Item.action(itemTitle(name)) { restore(name) } }
+            if names.count > 1 { items += [.divider, .action(allTitle) { restoreAll() }] }
+            ActionMenu.show(items)
+        } label: {
+            Text(text)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 4)
+        }
+        .buttonStyle(RowButtonStyle())
+        .help(help)
+    }
+
+    private func countMenu(_ merchant: String) {
+        ActionMenu.show([.action("Don't count \(merchant)") { store.hide(merchant) }])
     }
 
     private func purchaseRow(_ txn: Transaction, account: Account?) -> some View {
         let card = account?.shortName
         let detail = txn.pending == true ? card.map { "Pending on \($0)" } ?? "Pending" : card
-        return Button { hideMenu(txn.merchant) } label: {
+        return Button { countMenu(txn.merchant) } label: {
             ItemRow(title: txn.merchant, amount: txn.amount) {
                 MerchantIcon(logo: txn.logoUrl.flatMap(URL.init(string:)), symbol: txn.symbol)
             } detail: {
@@ -209,7 +211,7 @@ struct MenuView: View {
     }
 
     private func merchantRow(_ merchant: MerchantTotal, share: Double) -> some View {
-        Button { hideMenu(merchant.name) } label: { merchantRowContent(merchant, share: share) }
+        Button { countMenu(merchant.name) } label: { merchantRowContent(merchant, share: share) }
             .buttonStyle(RowButtonStyle())
     }
 
@@ -230,7 +232,8 @@ struct MenuView: View {
     @ViewBuilder
     private var recurringSection: some View {
         let items = store.recurring
-        if !items.isEmpty {
+        let dismissed = store.dismissedRecurring.sorted()
+        if !items.isEmpty || !dismissed.isEmpty {
             let increase = items.first { ($0.change ?? 0) > 0 }
             VStack(alignment: .leading, spacing: 0) {
                 CollapsibleHeader(
@@ -242,6 +245,11 @@ struct MenuView: View {
                 )
                 if recurringExpanded {
                     ForEach(items) { recurringRow($0) }
+                    if !dismissed.isEmpty {
+                        restoreNote("\(dismissed.count) dismissed", help: "Marked as not recurring. Click to restore.",
+                                    names: dismissed, itemTitle: { "Restore \($0)" }, allTitle: "Restore all",
+                                    restore: store.restoreRecurring, restoreAll: store.restoreAllRecurring)
+                    }
                 }
             }
         }
@@ -249,7 +257,10 @@ struct MenuView: View {
 
     private func recurringRow(_ item: Recurring) -> some View {
         let next = item.next.formatted(.dateTime.month(.abbreviated).day())
-        return Button { hideMenu(item.name) } label: {
+        let counted = store.isCounted(item.name)
+        return Button {
+            ActionMenu.show([.action("Not a recurring charge") { store.dismissRecurring(item.name) }])
+        } label: {
             ItemRow(title: item.name, amount: item.amount) {
                 MerchantIcon(logo: item.sample.logoUrl.flatMap(URL.init(string:)), symbol: item.sample.symbol)
             } detail: {
@@ -257,10 +268,13 @@ struct MenuView: View {
                     Text("Went up \(change.formatted(.currency(code: "USD"))), next \(next)").foregroundStyle(.orange)
                 } else if let change = item.change {
                     Text("Went down \((-change).formatted(.currency(code: "USD"))), next \(next)")
+                } else if !counted {
+                    Text("\(item.cadence.label), not counted in totals")
                 } else {
                     Text("\(item.cadence.label), next \(next)")
                 }
             }
+            .opacity(counted ? 1 : 0.5)
         }
         .buttonStyle(RowButtonStyle())
     }

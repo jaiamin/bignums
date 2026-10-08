@@ -141,11 +141,16 @@ final class Store {
     private(set) var excludedAccounts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "excludedAccounts") ?? []) {
         didSet { UserDefaults.standard.set(Array(excludedAccounts), forKey: "excludedAccounts") }
     }
-    /// Merchants left out of every total (e.g. rent, which dwarfs everything else). Stored in UserDefaults.
+    /// Merchants left out of spending totals (e.g. rent, which dwarfs everything else). They still appear in
+    /// Recurring, since you still pay them. Stored in UserDefaults.
     private(set) var hiddenMerchants: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "hiddenMerchants") ?? []) {
         didSet { UserDefaults.standard.set(Array(hiddenMerchants), forKey: "hiddenMerchants") }
     }
     private var hiddenKeys: Set<String> { Set(hiddenMerchants.map { $0.lowercased() }) }
+    /// Merchants the user said aren't recurring charges (a false match). Only affects Recurring. Stored in UserDefaults.
+    private(set) var dismissedRecurring: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "dismissedRecurring") ?? []) {
+        didSet { UserDefaults.standard.set(Array(dismissedRecurring), forKey: "dismissedRecurring") }
+    }
 
     private var plaid: Plaid?
     private var linkTask: Task<Void, Never>?
@@ -227,21 +232,27 @@ final class Store {
     func hide(_ merchant: String) { hiddenMerchants.insert(merchant) }
     func unhide(_ merchant: String) { hiddenMerchants.remove(merchant) }
     func unhideAll() { hiddenMerchants.removeAll() }
+    func isCounted(_ merchant: String) -> Bool { !hiddenKeys.contains(merchant.lowercased()) }
 
-    // MARK: Recurring & projection
+    func dismissRecurring(_ merchant: String) { dismissedRecurring.insert(merchant) }
+    func restoreRecurring(_ merchant: String) { dismissedRecurring.remove(merchant) }
+    func restoreAllRecurring() { dismissedRecurring.removeAll() }
+
+    // MARK: Recurring
 
     /// Charges that repeat at a steady interval with a steady price, still active, soonest first.
-    /// Respects hidden merchants and excluded accounts, like every other number.
+    /// Includes merchants that aren't counted in totals (you still pay them); leaves out excluded accounts
+    /// (not your money) and charges dismissed as not recurring.
     var recurring: [Recurring] {
         let cal = Calendar.current
         let today = cal.startOfDay(for: referenceDate)
-        let hidden = hiddenKeys
+        let dismissed = Set(dismissedRecurring.map { $0.lowercased() })
         var byMerchant: [String: [(date: Date, txn: Transaction)]] = [:]
         for txn in connections.flatMap(\.transactions.values) where txn.amount > 0 && txn.pending != true {
             if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
             if let accountID = txn.accountId, excludedAccounts.contains(accountID) { continue }
             let key = txn.merchant.lowercased()
-            guard !hidden.contains(key), let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date) else { continue }
+            guard !dismissed.contains(key), let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date) else { continue }
             byMerchant[key, default: []].append((date, txn))
         }
 
@@ -276,40 +287,6 @@ final class Store {
         }
         return result.sorted { $0.next < $1.next }
     }
-
-    /// Where a running week or month is heading: what's spent so far, plus typical day-to-day spending for the days
-    /// left, plus recurring charges due before it ends. Nil for finished periods or without 4 weeks of history.
-    func projection(for interval: DateInterval) -> Double? {
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: referenceDate)
-        guard interval.contains(today), let tomorrow = cal.date(byAdding: .day, value: 1, to: today),
-              let windowStart = cal.date(byAdding: .day, value: -28, to: tomorrow),
-              let historyStart, windowStart >= historyStart else { return nil }
-        let remainingDays = cal.dateComponents([.day], from: tomorrow, to: interval.end).day ?? 0
-        guard remainingDays > 0 else { return nil }
-
-        let recurring = recurring
-        let recurringKeys = Set(recurring.map { $0.name.lowercased() })
-        // Everyday spending leaves out recurring charges (added separately below) and one-off big purchases.
-        func everyday(_ range: DateInterval) -> Double {
-            breakdown(range).purchases
-                .filter { !recurringKeys.contains($0.merchant.lowercased()) && $0.amount < Self.oneOffThreshold }
-                .reduce(0) { $0 + $1.amount }
-        }
-        // Daily rate: the last 4 weeks at first, shifting to this period's own pace over its first 14 days, so an
-        // unusually heavy (or light) last month doesn't dominate once this one has shown its own pattern.
-        let elapsedDays = Double(cal.dateComponents([.day], from: interval.start, to: tomorrow).day ?? 1)
-        let recentRate = everyday(DateInterval(start: windowStart, end: tomorrow)) / 28
-        let periodRate = everyday(DateInterval(start: interval.start, end: tomorrow)) / elapsedDays
-        let trust = min(elapsedDays / 14, 1)
-        let rate = trust * periodRate + (1 - trust) * recentRate
-
-        let upcoming = recurring.filter { $0.next >= tomorrow && $0.next < interval.end }.reduce(0) { $0 + $1.amount }
-        return breakdown(interval).total + rate * Double(remainingDays) + upcoming
-    }
-
-    /// Purchases this big (a flight, a laptop) are treated as one-offs, not part of a typical day.
-    private static let oneOffThreshold = 500.0
 
     /// Menu bar text: always the current day, week and month, whatever the menu is browsing.
     var label: String {

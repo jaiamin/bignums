@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Debug-only: renders the menu to a PNG so the design can be reviewed without clicking the menu bar.
 /// `BIGNUMS_SNAPSHOT=out.png [BIGNUMS_PERIOD=Day|Week|Month] [BIGNUMS_DARK=1] [BIGNUMS_ACCOUNTS=1] [BIGNUMS_RECURRING=1]
-/// [BIGNUMS_HIDDEN=merchant] swift run`
+/// [BIGNUMS_HIDDEN=merchant] [BIGNUMS_DISMISSED=merchant] swift run`
 @MainActor
 enum Snapshot {
     static func renderIfRequested() {
@@ -13,6 +13,7 @@ enum Snapshot {
         UserDefaults.standard.set(env["BIGNUMS_ACCOUNTS"] != nil, forKey: "accountsExpanded")
         UserDefaults.standard.set(env["BIGNUMS_RECURRING"] != nil, forKey: "recurringExpanded")
         UserDefaults.standard.set(env["BIGNUMS_HIDDEN"].map { [$0] } ?? [], forKey: "hiddenMerchants")
+        UserDefaults.standard.set(env["BIGNUMS_DISMISSED"].map { [$0] } ?? [], forKey: "dismissedRecurring")
 
         let root = MenuView(store: Store(autoRefresh: false))
             .background(Color(nsColor: .windowBackgroundColor))
