@@ -874,7 +874,10 @@ private enum StatusItemMenu {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
             guard let window = event.window, window.className.contains("StatusBar") else { return event }
-            ActionMenu.show([.action(store.hideNumbers ? "Show numbers" : "Hide numbers") { store.hideNumbers.toggle() }])
+            ActionMenu.show([
+                .action(store.hideNumbers ? "Show numbers" : "Hide numbers") { store.hideNumbers.toggle() },
+                .action("Notify on new charges", checked: store.notifyCharges) { store.notifyCharges.toggle() },
+            ])
             return nil
         }
     }

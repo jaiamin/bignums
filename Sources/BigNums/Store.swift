@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Observation
+import UserNotifications
 
 struct Connection: Codable, Identifiable {
     let id: String  // Plaid item_id
@@ -159,6 +160,14 @@ final class Store {
         didSet { UserDefaults.standard.set(hideNumbers, forKey: "hideNumbers") }
     }
 
+    /// macOS notification for each new charge made today. Stored in UserDefaults; on unless turned off.
+    var notifyCharges = UserDefaults.standard.object(forKey: "notifyCharges") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(notifyCharges, forKey: "notifyCharges")
+            if notifyCharges { Self.requestNotificationAccess() }
+        }
+    }
+
     private var plaid: Plaid?
     private var linkTask: Task<Void, Never>?
     private var timer: Timer?
@@ -189,6 +198,7 @@ final class Store {
         load()
         do { plaid = Plaid(config: try PlaidConfig.load()) } catch { message = error.localizedDescription }
         guard autoRefresh else { return }
+        if notifyCharges { Self.requestNotificationAccess() }
         timer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
             Task { await self?.refresh() }
         }
@@ -345,6 +355,8 @@ final class Store {
         do {
             let result = try await plaid.sync(accessToken: connection.accessToken, cursor: connection.cursor)
             guard let i = connections.firstIndex(where: { $0.id == id }) else { return }
+            // The first sync loads history, which isn't news.
+            if connection.cursor != nil { notifyNewCharges(result, existing: connections[i].transactions) }
             for txn in result.added { connections[i].transactions[txn.transactionId] = txn }
             for txnID in result.removed { connections[i].transactions[txnID] = nil }
             if let accounts = result.accounts { connections[i].accounts = accounts }
@@ -384,6 +396,36 @@ final class Store {
             }
         }
         save()
+    }
+
+    // MARK: Notifications
+
+    /// Notifies for charges from today that we haven't seen before. A pending charge that posts arrives as a new
+    /// transaction while the pending one is removed, so a posted charge matching a removed one isn't new.
+    private func notifyNewCharges(_ result: SyncResult, existing: [String: Transaction]) {
+        guard notifyCharges else { return }
+        let today = Self.dayFormatter.string(from: Date())
+        let removed = result.removed.compactMap { existing[$0] }
+        let hidden = hiddenKeys
+        for txn in result.added where existing[txn.transactionId] == nil && txn.amount > 0 {
+            guard (txn.authorizedDate ?? txn.date) == today else { continue }
+            if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
+            if let accountID = txn.accountId, excludedAccounts.contains(accountID) { continue }
+            if hidden.contains(txn.merchant.lowercased()) { continue }
+            if txn.pending != true, removed.contains(where: { $0.accountId == txn.accountId && abs($0.amount - txn.amount) < 0.01 }) { continue }
+            let amount = txn.amount.formatted(.currency(code: "USD"))
+            let content = UNMutableNotificationContent()
+            content.title = "\(amount) at \(txn.merchant)"
+            content.body = [accountLabel(txn.accountId), txn.pending == true ? "Pending" : nil].compactMap { $0 }.joined(separator: " · ")
+            content.sound = .default
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: txn.transactionId, content: content, trigger: nil))
+        }
+    }
+
+    /// Notifications need a real app bundle, so this does nothing under `swift run`.
+    private static func requestNotificationAccess() {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
     /// A bank website's own icon as base64 PNG. Prefers the largest icon its homepage declares (Wells Fargo's links
