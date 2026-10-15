@@ -34,6 +34,7 @@ struct MenuView: View {
     @AppStorage("accountsExpanded") private var accountsExpanded = false
     @AppStorage("recurringExpanded") private var recurringExpanded = false
     @AppStorage("trendExpanded") private var trendExpanded = false
+    @AppStorage("netWorthExpanded") private var netWorthExpanded = false
     @State private var offset = 0  // 0 = current period, -1 = previous, ...
     @State private var removing: String?  // connection awaiting remove confirmation
     @State private var window: NSWindow?
@@ -58,6 +59,8 @@ struct MenuView: View {
                     .padding(.top, 18)
                 recurringSection
                     .padding(.top, 18)
+                netWorthSection
+                    .padding(.top, 4)
                 accounts(breakdown)
                     .padding(.top, 4)
             }
@@ -338,6 +341,76 @@ struct MenuView: View {
             .opacity(counted ? 1 : 0.5)
         }
         .buttonStyle(RowButtonStyle())
+    }
+
+    // MARK: Net worth
+
+    @ViewBuilder
+    private var netWorthSection: some View {
+        if let worth = store.netWorth {
+            VStack(alignment: .leading, spacing: 0) {
+                CollapsibleHeader(title: "Net worth", value: Store.money(worth.total), alert: nil, alertColor: .secondary,
+                                  expanded: $netWorthExpanded)
+                if netWorthExpanded {
+                    netWorthGroup("Assets", worth.assets, total: worth.assetsTotal, sign: 1)
+                    netWorthGroup("Debts", worth.debts, total: worth.debtsTotal, sign: -1)
+                        .padding(.top, worth.assets.isEmpty ? 0 : 8)
+                    netWorthChange
+                }
+            }
+        }
+    }
+
+    /// A subtotal heading, then one row per account with its bank's logo and its balance.
+    @ViewBuilder
+    private func netWorthGroup(_ title: String, _ lines: [Store.NetWorth.Line], total: Double, sign: Double) -> some View {
+        if !lines.isEmpty {
+            // One container, so spacing applied to the group lands once rather than on every row.
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text(title)
+                    Spacer()
+                    Text(Store.money(total * sign))
+                        .monospacedDigit()
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, Self.inset)
+                .padding(.top, 4)
+                .padding(.bottom, 2)
+                ForEach(lines) { line in
+                    let connection = store.connections.first { $0.id == line.connectionID }
+                    ItemRow(title: line.account.displayName, icon: {
+                        if let connection { BankLogo(connection: connection) }
+                    }, detail: {
+                        Text(line.account.kind)
+                    }, trailing: {
+                        Text((line.balance * sign).formatted(.currency(code: "USD")))
+                            .font(.system(size: 13))
+                            .monospacedDigit()
+                    })
+                    .padding(.horizontal, Self.inset)
+                }
+            }
+        }
+    }
+
+    /// How net worth moved since the earliest figure we've recorded in the last 30 days.
+    @ViewBuilder
+    private var netWorthChange: some View {
+        if let change = store.netWorthChange(), abs(change.amount) >= 1 {
+            let up = change.amount > 0
+            HStack(spacing: 4) {
+                Image(systemName: up ? "arrow.up.right" : "arrow.down.right")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("\(Store.money(abs(change.amount))) since \(change.since.formatted(.dateTime.month(.abbreviated).day()))")
+            }
+            .font(.system(size: 12))
+            .foregroundStyle(up ? Color.secondary : Color.orange)
+            .padding(.horizontal, Self.inset)
+            .padding(.top, 8)
+            .padding(.bottom, 2)
+        }
     }
 
     // MARK: Accounts

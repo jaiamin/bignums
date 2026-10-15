@@ -61,7 +61,13 @@ struct Account: Codable, Identifiable {
     let mask: String?
     let type: String?  // credit, depository, loan, investment
     let subtype: String?  // credit card, checking, savings, ...
+    var balances: Balances?
     var id: String { accountId }
+
+    struct Balances: Codable {
+        let current: Double?  // what's in a deposit/investment account, or what's owed on a credit/loan account
+        let available: Double?
+    }
 }
 
 struct HostedLink {

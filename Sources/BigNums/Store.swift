@@ -299,6 +299,66 @@ final class Store {
         return result
     }
 
+    // MARK: Net worth
+
+    /// What you own minus what you owe, from the latest balances. Accounts left out of totals aren't yours to count.
+    struct NetWorth {
+        struct Line: Identifiable {
+            let account: Account
+            let connectionID: String
+            let balance: Double
+            var id: String { account.id }
+        }
+
+        var assets: [Line] = []  // deposit and investment accounts, biggest first
+        var debts: [Line] = []  // credit cards and loans: what's owed, biggest first
+        var assetsTotal: Double { assets.reduce(0) { $0 + $1.balance } }
+        var debtsTotal: Double { debts.reduce(0) { $0 + $1.balance } }
+        var total: Double { assetsTotal - debtsTotal }
+    }
+
+    /// Nil until Plaid has sent balances. Accounts at exactly zero are left out as noise.
+    var netWorth: NetWorth? {
+        var result = NetWorth()
+        for connection in connections {
+            for account in connection.accounts ?? [] where !excludedAccounts.contains(account.id) {
+                guard let balance = account.balances?.current, balance != 0 else { continue }
+                let line = NetWorth.Line(account: account, connectionID: connection.id, balance: balance)
+                switch account.type {
+                case "depository", "investment": result.assets.append(line)
+                case "credit", "loan": result.debts.append(line)
+                default: continue
+                }
+            }
+        }
+        guard !result.assets.isEmpty || !result.debts.isEmpty else { return nil }
+        result.assets.sort { $0.balance > $1.balance }
+        result.debts.sort { $0.balance > $1.balance }
+        return result
+    }
+
+    /// One net worth figure per day, kept so the change over time can be shown (Plaid only gives today's balances).
+    /// Stored in UserDefaults.
+    private(set) var netWorthHistory: [String: Double] = UserDefaults.standard.dictionary(forKey: "netWorthHistory") as? [String: Double] ?? [:]
+
+    private func recordNetWorth() {
+        guard let total = netWorth?.total else { return }
+        netWorthHistory[Self.dayFormatter.string(from: Date())] = total
+        let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-730 * 86400))
+        netWorthHistory = netWorthHistory.filter { $0.key >= cutoff }
+        UserDefaults.standard.set(netWorthHistory, forKey: "netWorthHistory")
+    }
+
+    /// Change since the oldest figure recorded in the last 30 days, once that's at least a day old.
+    func netWorthChange() -> (amount: Double, since: Date)? {
+        guard let current = netWorth?.total else { return nil }
+        let cutoff = Self.dayFormatter.string(from: referenceDate.addingTimeInterval(-30 * 86400))
+        let today = Self.dayFormatter.string(from: referenceDate)
+        guard let oldest = netWorthHistory.filter({ $0.key >= cutoff && $0.key < today }).min(by: { $0.key < $1.key }),
+              let since = Self.dayFormatter.date(from: oldest.key) else { return nil }
+        return (current - oldest.value, since)
+    }
+
     // MARK: Usual spending
 
     /// What you typically spend over the same stretch as `interval`, as the median of recent comparable periods, so a
@@ -439,6 +499,7 @@ final class Store {
         isRefreshing = true
         for id in connections.map(\.id) { await sync(id) }
         isRefreshing = false
+        recordNetWorth()
         lastRefresh = Date()  // also re-evaluates the day/week/month boundaries
     }
 
@@ -458,8 +519,8 @@ final class Store {
             // Keep up to 2 years for browsing past periods (the most Plaid provides).
             let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-730 * 86400))
             connections[i].transactions = transactions.filter { $0.value.date >= cutoff }
-            // Fetch the account list if we've never received one (or saved it before account types were stored).
-            if connections[i].accounts.map({ $0.isEmpty || $0.contains { $0.type == nil } }) ?? true, let accounts = try? await plaid.accounts(accessToken: connection.accessToken),
+            // Plaid only sends accounts on the first sync, so ask for them each time to keep balances current.
+            if let accounts = try? await plaid.accounts(accessToken: connection.accessToken),
                let i = connections.firstIndex(where: { $0.id == id }) {
                 connections[i].accounts = accounts
             }
