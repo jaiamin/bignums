@@ -62,30 +62,36 @@ struct LensStrip: View {
     }
 }
 
-/// Footer navigation: icon and label for the current tab, a small dot on a tab that needs a look.
+/// Footer navigation: icons, with the current tab's name beside its icon, a small dot on a tab that needs a look.
 struct TabBar: View {
     @Binding var selection: Tab
     let attention: [Tab: Color]
+    var active = true  // false while another screen (Ask) is showing, so no tab looks selected
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(Tab.allCases) { tab in
                 Button { selection = tab } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: tab.symbol)
                             .font(.system(size: 11, weight: .medium))
-                        Text(tab.title)
-                            .font(.system(size: 11, weight: selection == tab ? .semibold : .regular))
+                        // Only the current tab spells itself out; the others are icons, which keeps room for the rest of the footer.
+                        if active && selection == tab {
+                            Text(tab.title)
+                                .font(.system(size: 11, weight: .semibold))
+                                .lineLimit(1)
+                                .fixedSize()
+                        }
                     }
-                    .foregroundStyle(selection == tab ? Color.primary : Color.secondary)
+                    .foregroundStyle((active && selection == tab) ? Color.primary : Color.secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.primary.opacity(selection == tab ? 0.08 : 0))
+                            .fill(Color.primary.opacity(active && selection == tab ? 0.08 : 0))
                     )
                     .overlay(alignment: .topTrailing) {
-                        if let color = attention[tab], selection != tab {
+                        if let color = attention[tab], !(active && selection == tab) {
                             Circle().fill(color).frame(width: 5, height: 5).offset(x: -2, y: 3)
                         }
                     }

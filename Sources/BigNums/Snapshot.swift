@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Debug-only: renders the menu to a PNG so the design can be reviewed without clicking the menu bar.
 /// `BIGNUMS_SNAPSHOT=out.png [BIGNUMS_TAB=spend|bills|balances] [BIGNUMS_LENS=merchants|categories|cards|trend]
-/// [BIGNUMS_PERIOD=Day|Week|Month] [BIGNUMS_DARK=1] [BIGNUMS_REFRESH=1] [BIGNUMS_HIDDEN=merchant] [BIGNUMS_DISMISSED=merchant] swift run`
+/// [BIGNUMS_PERIOD=Day|Week|Month] [BIGNUMS_DARK=1] [BIGNUMS_REFRESH=1] [BIGNUMS_ASK_OPEN=1] [BIGNUMS_ASK='question|another'] [BIGNUMS_HIDDEN=merchant] [BIGNUMS_DISMISSED=merchant] swift run`
 @MainActor
 enum Snapshot {
     static func renderIfRequested() {
@@ -21,6 +21,18 @@ enum Snapshot {
             var done = false
             Task { await store.refresh(); done = true }
             while !done { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
+        }
+        // Open the Ask screen, optionally asking real questions of the on-device model first.
+        UserDefaults.standard.set(env["BIGNUMS_ASK_OPEN"] != nil || env["BIGNUMS_ASK"] != nil, forKey: "askOpen")
+        if let questions = env["BIGNUMS_ASK"], #available(macOS 26.0, *) {
+            let assistant = AssistantProvider.assistant(for: store)
+            for question in questions.split(separator: "|") {
+                var done = false
+                let start = Date()
+                Task { await assistant.ask(String(question)); done = true }
+                while !done { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05)) }
+                if let turn = assistant.turns.last { print("Q: \(turn.question)\nA: \(turn.answer)  [\(String(format: "%.1f", Date().timeIntervalSince(start)))s]\n") }
+            }
         }
         let root = MenuView(store: store)
             .background(Color(nsColor: .windowBackgroundColor))

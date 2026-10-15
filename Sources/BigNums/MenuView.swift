@@ -4,6 +4,8 @@ import SwiftUI
 struct MenuView: View {
     let store: Store
     @AppStorage("tab") private var tab: Tab = .spend
+    @AppStorage("askOpen") private var asking = false  // the Ask screen is showing instead of a tab
+    @AppStorage("assistantEnabled") private var assistantEnabled = true
     @State private var offset = 0  // Spend's period offset; kept here so it survives the content relaying out
     @State private var removing: String?  // connection awaiting remove confirmation
     @State private var window: NSWindow?
@@ -24,9 +26,13 @@ struct MenuView: View {
                     }
                     .padding(.bottom, 12)
                 }
-                CappedScroll(maxHeight: MenuMetrics.tabMaxHeight) {
-                    tabContent
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                if asking && assistantVisible {
+                    AskView(store: store)
+                } else {
+                    CappedScroll(maxHeight: MenuMetrics.tabMaxHeight) {
+                        tabContent
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
             }
 
@@ -72,6 +78,7 @@ struct MenuView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { note in
             if note.object as? NSWindow === window {
                 isOpen = false
+                asking = false
                 offset = 0
                 removing = nil
                 tab = .spend
@@ -79,6 +86,9 @@ struct MenuView: View {
         }
         .task { await store.refreshIfStale() }
     }
+
+    /// The sparkle button and Ask screen exist only where the on-device model could ever run, and unless switched off.
+    private var assistantVisible: Bool { assistantEnabled && AssistantSupport.status != .notSupported }
 
     @ViewBuilder
     private var tabContent: some View {
@@ -142,9 +152,20 @@ struct MenuView: View {
     private var footer: some View {
         HStack(spacing: 4) {
             if !store.connections.isEmpty {
-                TabBar(selection: $tab, attention: attention)
+                TabBar(selection: Binding(get: { tab }, set: { tab = $0; asking = false }), attention: attention, active: !asking)
             }
             Spacer()
+            if assistantVisible && !store.connections.isEmpty {
+                Button { asking.toggle() } label: {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(asking ? Color.primary : Color.secondary)
+                        .frame(width: 24, height: 22)
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(asking ? 0.08 : 0)))
+                        .contentShape(Rectangle())
+                }
+                .help("Ask about your money (⌘K)")
+            }
             // Re-evaluated every minute, so the tooltip's "Updated 3 minutes ago" never goes stale while the menu is open.
             TimelineView(.everyMinute) { _ in
                 Button { Task { await store.refresh() } } label: {
@@ -186,6 +207,12 @@ struct MenuView: View {
             .action("Show numbers in menu bar", checked: !store.hideNumbers) { store.hideNumbers.toggle() },
             .action("Notify on new charges", checked: store.notifyCharges) { store.notifyCharges.toggle() },
         ]
+        if AssistantSupport.status != .notSupported {
+            items.append(.action("Ask assistant (experimental)", checked: assistantEnabled) {
+                assistantEnabled.toggle()
+                if !assistantEnabled { asking = false }
+            })
+        }
         // Merchants set aside stay reachable even in a period where they didn't charge you.
         let hidden = store.hiddenMerchants.sorted()
         if !hidden.isEmpty {
@@ -202,6 +229,8 @@ struct MenuView: View {
             Button("") { tab = .spend }.keyboardShortcut("1")
             Button("") { tab = .bills }.keyboardShortcut("2")
             Button("") { tab = .balances }.keyboardShortcut("3")
+            Button("") { if assistantVisible { asking.toggle() } }.keyboardShortcut("k")
+            Button("") { asking = false }.keyboardShortcut(.cancelAction)
             Button("") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
         }
         .opacity(0)

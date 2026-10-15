@@ -837,3 +837,109 @@ final class Store {
         }
     }
 }
+
+// MARK: - Assistant queries
+
+/// What the assistant can ask the data. Everything numeric the assistant says comes from here, never from the model.
+struct SpendingQuery {
+    var interval: DateInterval
+    var merchant: String?
+    var category: String?
+    var account: String?  // matched against the card's name, kind and last digits
+}
+
+enum SpendingGroup { case none, merchant, category, card, day, month }
+
+struct SpendingSummary {
+    struct Group {
+        let name: String
+        var total: Double
+        var count: Int
+        let sortKey: String
+    }
+
+    var total = 0.0
+    var count = 0
+    var groups: [Group] = []
+    var largest: [Transaction] = []
+    var notCounted = 0.0  // matched, but at a merchant you've set aside, so left out of the total
+}
+
+extension Store {
+    /// Lowercase letters and digits only, with "&" read as "and", so "Food & drink" matches FOOD_AND_DRINK.
+    private static func normalized(_ text: String) -> String {
+        text.lowercased().replacingOccurrences(of: "&", with: "and").filter { $0.isLetter || $0.isNumber }
+    }
+
+    /// Counted spending that matches the filters, with the same rules as the totals in the app: set-aside merchants and
+    /// excluded accounts don't count, pending charges do.
+    func spendingSummary(_ query: SpendingQuery, groupBy: SpendingGroup, limit: Int) -> SpendingSummary {
+        let entries = index
+        let hidden = hiddenKeys
+        let accounts = accountsByID
+        let now = referenceDate
+        func needle(_ text: String?) -> String? { text.map(Self.normalized).flatMap { $0.isEmpty ? nil : $0 } }
+        let merchantNeedle = needle(query.merchant), categoryNeedle = needle(query.category), accountNeedle = needle(query.account)
+
+        let cal = Calendar.current
+        var categoryNames: [String: String] = [:]
+        var groups: [String: SpendingSummary.Group] = [:]
+        var summary = SpendingSummary()
+        var matched: [Transaction] = []
+
+        var i = lowerBound(entries, query.interval.start)
+        while i < entries.count, entries[i].date < query.interval.end {
+            let entry = entries[i]
+            i += 1
+            guard entry.date <= now else { continue }
+            let txn = entry.txn
+            let account = txn.accountId.flatMap { accounts[$0] }
+            if let id = txn.accountId, excludedAccounts.contains(id) { continue }
+            if let merchantNeedle, !Self.normalized(entry.merchantKey).contains(merchantNeedle) { continue }
+            let categoryKey = txn.personalFinanceCategory?.primary ?? "OTHER"
+            let categoryName = categoryNames[categoryKey] ?? CategoryTotal(key: categoryKey, total: 0, count: 0).name
+            categoryNames[categoryKey] = categoryName
+            if let categoryNeedle {
+                let name = Self.normalized(categoryName), key = Self.normalized(categoryKey)
+                guard name.contains(categoryNeedle) || key.contains(categoryNeedle) || categoryNeedle.contains(name) else { continue }
+            }
+            if let accountNeedle {
+                guard let account,
+                      Self.normalized("\(account.displayName) \(account.mask ?? "") \(account.subtype ?? "")").contains(accountNeedle) else { continue }
+            }
+            if hidden.contains(entry.merchantKey) {
+                summary.notCounted += txn.amount
+                continue
+            }
+            summary.total += txn.amount
+            summary.count += 1
+            matched.append(txn)
+
+            let name: String, sortKey: String
+            switch groupBy {
+            case .none: continue
+            case .merchant: (name, sortKey) = (txn.merchant, txn.merchant.lowercased())
+            case .category: (name, sortKey) = (categoryName, categoryKey)
+            case .card: (name, sortKey) = (account?.shortName ?? "Unknown account", account?.id ?? "")
+            case .day:
+                (name, sortKey) = (entry.date.formatted(.dateTime.month(.abbreviated).day()), Self.dayFormatter.string(from: entry.date))
+            case .month:
+                let start = cal.dateInterval(of: .month, for: entry.date)?.start ?? entry.date
+                (name, sortKey) = (start.formatted(.dateTime.month(.abbreviated).year()), Self.dayFormatter.string(from: start))
+            }
+            groups[sortKey, default: .init(name: name, total: 0, count: 0, sortKey: sortKey)].total += txn.amount
+            groups[sortKey]!.count += 1
+        }
+
+        switch groupBy {
+        case .day, .month: summary.groups = Array(groups.values.sorted { $0.sortKey < $1.sortKey }.suffix(limit))  // the most recent
+        default: summary.groups = Array(groups.values.sorted { $0.total > $1.total }.prefix(limit))
+        }
+        summary.largest = Array(matched.sorted { $0.amount > $1.amount }.prefix(limit))
+        return summary
+    }
+
+    func displayDate(_ txn: Transaction) -> String {
+        Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date)?.formatted(.dateTime.month(.abbreviated).day()) ?? txn.date
+    }
+}
