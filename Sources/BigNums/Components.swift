@@ -3,61 +3,57 @@ import SwiftUI
 
 // MARK: - Building blocks
 
-/// The one bold element: a light, large figure with a quieter dollar sign.
+/// The one bold element: a light, large figure with a quieter dollar sign (and an optional unit like "/mo").
 struct HeroAmount: View {
     let value: Double
+    var suffix: String?
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 1) {
+            if value < 0 {
+                Text("−")
+                    .font(.system(size: 26, weight: .light))
+                    .foregroundStyle(.secondary)
+            }
             Text("$")
                 .font(.system(size: 26, weight: .light))
                 .foregroundStyle(.secondary)
-            Text(value.formatted(.number.precision(.fractionLength(0))))
+            Text(value.magnitude.formatted(.number.precision(.fractionLength(0))))
                 .font(.system(size: 44, weight: .light))
                 .monospacedDigit()
                 .contentTransition(.numericText())
                 // Animate only the number: animating the layout makes the content resize smoothly while the
                 // menu window jumps to its new size, leaving see-through gaps at the top and bottom.
                 .animation(.snappy, value: value)
+            if let suffix {
+                Text(suffix)
+                    .font(.system(size: 15, weight: .light))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 3)
+            }
         }
     }
 }
 
-/// Section title that opens and closes its section. While closed, an alert (if any) replaces the summary value.
-struct CollapsibleHeader: View {
-    let title: String
-    let value: String
-    let alert: String?
-    let alertColor: Color
-    @Binding var expanded: Bool
+/// What every tab opens with: a small label, the big number, and one line of context beneath it.
+struct Hero: View {
+    let label: String
+    let value: Double
+    var suffix: String?
+    var context: Text?
 
     var body: some View {
-        Button { expanded.toggle() } label: {
-            HStack(spacing: 6) {
-                Text(title)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let alert, !expanded {
-                    Text(alert)
-                        .font(.system(size: 11))
-                        .foregroundStyle(alertColor)
-                        .lineLimit(1)
-                } else {
-                    Text(value)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 12)
-            }
-            .padding(.vertical, 4)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+            HeroAmount(value: value, suffix: suffix)
+            // Always reserve the line so the layout doesn't shift when there's nothing to say.
+            (context ?? Text(" "))
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
         }
-        .buttonStyle(RowButtonStyle())
-        .help(expanded ? "Hide \(title.lowercased())" : "Show \(title.lowercased())")
+        .padding(.horizontal, MenuView.inset)
     }
 }
 
@@ -71,6 +67,25 @@ struct SectionTitle: View {
             .foregroundStyle(.secondary)
             .padding(.horizontal, MenuView.inset)
             .padding(.bottom, 4)
+    }
+}
+
+/// Heading for a group of rows, with an optional subtotal on the right.
+struct GroupHeader: View {
+    let title: String
+    var total: String?
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if let total { Text(total).monospacedDigit() }
+        }
+        .font(.system(size: 11, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, MenuView.inset)
+        .padding(.top, 4)
+        .padding(.bottom, 2)
     }
 }
 
@@ -192,6 +207,7 @@ struct BankLogo: View {
 /// A merchant's share of the period's spending. Neutral, so the total stays the only emphasis.
 struct ShareBar: View {
     let share: Double
+    var help = " of spending"
 
     var body: some View {
         // Fill only, no track: a track's ragged start (after "1 purchase" vs "12 purchases") reads as noise.
@@ -202,7 +218,7 @@ struct ShareBar: View {
                 .frame(maxHeight: .infinity)
         }
         .frame(height: 3)
-        .help(share.formatted(.percent.precision(.fractionLength(0))) + " of spending")
+        .help(share.formatted(.percent.precision(.fractionLength(0))) + help)
     }
 }
 
@@ -295,6 +311,7 @@ struct TrendChart: View {
 enum ActionMenu {
     enum Item {
         case action(String, checked: Bool = false, () -> Void)
+        case label(String)  // greyed-out information
         case divider
     }
 
@@ -310,6 +327,10 @@ enum ActionMenu {
             switch item {
             case .divider:
                 if menu.items.last?.isSeparatorItem == false { menu.addItem(.separator()) }
+            case let .label(title):
+                let menuItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                menuItem.isEnabled = false
+                menu.addItem(menuItem)
             case let .action(title, checked, handler):
                 let target = Target(handler)
                 let menuItem = NSMenuItem(title: title, action: #selector(Target.run), keyEquivalent: "")
@@ -381,8 +402,11 @@ extension Store {
 }
 
 extension Transaction {
-    var symbol: String {
-        switch personalFinanceCategory?.detailed ?? personalFinanceCategory?.primary ?? "" {
+    var symbol: String { Self.symbol(forCategory: personalFinanceCategory?.detailed ?? personalFinanceCategory?.primary ?? "") }
+
+    /// Icon for a Plaid category, detailed ("FOOD_AND_DRINK_GROCERIES") or primary ("FOOD_AND_DRINK").
+    static func symbol(forCategory category: String) -> String {
+        switch category {
         case let c where c.hasPrefix("FOOD_AND_DRINK_GROCERIES"): "cart.fill"
         case let c where c.hasPrefix("FOOD_AND_DRINK"): "fork.knife"
         case let c where c.hasPrefix("GENERAL_MERCHANDISE"): "bag.fill"
@@ -422,5 +446,44 @@ extension Account {
     var shortName: String {
         let label = displayName.count <= 16 ? displayName : (subtype ?? "account")
         return mask.map { "\(label) ••\($0)" } ?? label
+    }
+}
+
+
+/// Quiet clickable line that lists what was set aside, each with a way to bring it back.
+struct RestoreNote: View {
+    let text: String
+    var amount: Double?
+    let help: String
+    let names: [String]
+    let itemTitle: (String) -> String
+    let allTitle: String
+    let restore: (String) -> Void
+    let restoreAll: () -> Void
+
+    var body: some View {
+        Button {
+            var items = names.map { name in ActionMenu.Item.action(itemTitle(name)) { restore(name) } }
+            if names.count > 1 { items += [.divider, .action(allTitle) { restoreAll() }] }
+            ActionMenu.show(items)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "eye.slash")
+                    .font(.system(size: 10))
+                    .frame(width: 14)
+                Text(text)
+                    .font(.system(size: 12))
+                Spacer()
+                if let amount {
+                    Text(amount.formatted(.currency(code: "USD")))
+                        .font(.system(size: 13))
+                        .monospacedDigit()
+                }
+            }
+            .foregroundStyle(.secondary)
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(RowButtonStyle())
+        .help(help)
     }
 }

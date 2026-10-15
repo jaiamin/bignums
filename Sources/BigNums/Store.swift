@@ -78,6 +78,30 @@ struct MerchantTotal: Identifiable {
     }
 }
 
+struct CategoryTotal: Identifiable {
+    let key: String  // Plaid's primary category, e.g. FOOD_AND_DRINK
+    var total: Double
+    var count: Int
+    var id: String { key }
+
+    /// "Food & drink"
+    var name: String {
+        let words = key.replacingOccurrences(of: "_AND_", with: " & ").replacingOccurrences(of: "_", with: " ").lowercased()
+        return words.prefix(1).uppercased() + words.dropFirst()
+    }
+
+    /// Purchases grouped by category, biggest total first.
+    static func all(_ purchases: [Transaction]) -> [CategoryTotal] {
+        var groups: [String: CategoryTotal] = [:]
+        for txn in purchases {
+            let key = txn.personalFinanceCategory?.primary ?? "OTHER"
+            groups[key, default: CategoryTotal(key: key, total: 0, count: 0)].total += txn.amount
+            groups[key]!.count += 1
+        }
+        return groups.values.sorted { $0.total > $1.total }
+    }
+}
+
 /// A charge that repeats on a steady schedule: a subscription or a bill.
 struct Recurring: Identifiable {
     enum Cadence: CaseIterable {
@@ -134,20 +158,29 @@ extension Transaction {
 
 @MainActor @Observable
 final class Store {
-    private(set) var connections: [Connection] = [] {
-        didSet { indexCache = nil; generation &+= 1 }
-    }
-    /// Bumped whenever something the derived data depends on changes, so cached results know they're stale.
+    private(set) var connections: [Connection] = []
+    /// Bumped when the index is replaced, which is how views that read derived data know to redraw.
     private var generation = 0
+    /// Counts every change to any transaction. `builtVersion` is the version the index was built from; while a sync's
+    /// background rebuild is running the two differ, and the previous index keeps serving (slightly old, never blocking).
+    @ObservationIgnored private var transactionsVersion = 0
+    @ObservationIgnored private var builtVersion = 0
+
+    /// Throws the caches away so the next read rebuilds them immediately. For changes that must show right away
+    /// (removing a bank, loading from disk). A sync doesn't use this: it rebuilds in the background instead.
+    private func transactionsChanged() {
+        transactionsVersion &+= 1
+        indexCache = nil
+        generation &+= 1
+    }
+
     private(set) var isLinking = false
     private(set) var isRefreshing = false
-    private(set) var lastRefresh: Date? {
-        didSet { generation &+= 1 }
-    }
+    private(set) var lastRefresh: Date?
     var message: String?
     /// Account IDs left out of the totals. Stored in UserDefaults.
     private(set) var excludedAccounts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "excludedAccounts") ?? []) {
-        didSet { UserDefaults.standard.set(Array(excludedAccounts), forKey: "excludedAccounts"); generation &+= 1 }
+        didSet { UserDefaults.standard.set(Array(excludedAccounts), forKey: "excludedAccounts")}
     }
     /// Merchants left out of spending totals (e.g. rent, which dwarfs everything else). They still appear in
     /// Recurring, since you still pay them. Stored in UserDefaults.
@@ -157,7 +190,7 @@ final class Store {
     private var hiddenKeys: Set<String> { Set(hiddenMerchants.map { $0.lowercased() }) }
     /// Merchants the user said aren't recurring charges (a false match). Only affects Recurring. Stored in UserDefaults.
     private(set) var dismissedRecurring: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "dismissedRecurring") ?? []) {
-        didSet { UserDefaults.standard.set(Array(dismissedRecurring), forKey: "dismissedRecurring"); generation &+= 1 }
+        didSet { UserDefaults.standard.set(Array(dismissedRecurring), forKey: "dismissedRecurring")}
     }
 
     /// Menu bar shows a placeholder instead of the amounts (for screen sharing, or just privacy). Stored in UserDefaults.
@@ -178,7 +211,7 @@ final class Store {
     private var timer: Timer?
 
     /// Transfers, card payments and income aren't spending (and would double-count checking -> credit card payments).
-    private static let ignoredCategories: Set<String> = ["TRANSFER_IN", "TRANSFER_OUT", "LOAN_PAYMENTS", "INCOME"]
+    private nonisolated static let ignoredCategories: Set<String> = ["TRANSFER_IN", "TRANSFER_OUT", "LOAN_PAYMENTS", "INCOME"]
 
     private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -224,7 +257,7 @@ final class Store {
 
     /// Earliest day we hold any transaction for; bounds browsing back and comparisons.
     var historyStart: Date? {
-        connections.flatMap(\.transactions.values).map(\.date).min().flatMap(Self.dayFormatter.date(from:))
+        index.first?.date
     }
 
     /// One spending-relevant charge with its date already parsed, so period math never touches strings.
@@ -238,20 +271,34 @@ final class Store {
     /// per change to the data; with thousands of transactions this keeps each period lookup to a binary search plus
     /// the handful of charges inside it.
     @ObservationIgnored private var indexCache: [Entry]?
-    @ObservationIgnored private var dayCache: [String: Date] = [:]
 
     private var index: [Entry] {
+        _ = generation  // so views using the index redraw when it's rebuilt
         if let indexCache { return indexCache }
+        let entries = Self.buildIndex(connections)
+        indexCache = entries
+        builtVersion = transactionsVersion
+        return entries
+    }
+
+    /// Pure, so it can also run off the main thread.
+    private nonisolated static func buildIndex(_ connections: [Connection]) -> [Entry] {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        var days: [String: Date] = [:]  // a few hundred distinct days across thousands of charges
         var entries: [Entry] = []
         for connection in connections {
             for txn in connection.transactions.values where txn.amount > 0 {
-                if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
+                if let category = txn.personalFinanceCategory?.primary, ignoredCategories.contains(category) { continue }
                 let day = txn.authorizedDate ?? txn.date
                 let date: Date
-                if let cached = dayCache[day] {
+                if let cached = days[day] {
                     date = cached
-                } else if let parsed = Self.dayFormatter.date(from: day) {
-                    dayCache[day] = parsed
+                } else if let parsed = formatter.date(from: day) {
+                    days[day] = parsed
                     date = parsed
                 } else {
                     continue
@@ -260,7 +307,6 @@ final class Store {
             }
         }
         entries.sort { $0.date < $1.date }
-        indexCache = entries
         return entries
     }
 
@@ -301,39 +347,46 @@ final class Store {
 
     // MARK: Net worth
 
-    /// What you own minus what you owe, from the latest balances. Accounts left out of totals aren't yours to count.
+    /// What you own minus what you owe, from the latest balances, with every account placed in a group. Accounts left
+    /// out of totals aren't yours to count, and account types we can't classify can't be added or subtracted.
     struct NetWorth {
         struct Line: Identifiable {
             let account: Account
             let connectionID: String
-            let balance: Double
+            let balance: Double?  // nil until Plaid has sent balances
             var id: String { account.id }
         }
 
-        var assets: [Line] = []  // deposit and investment accounts, biggest first
-        var debts: [Line] = []  // credit cards and loans: what's owed, biggest first
-        var assetsTotal: Double { assets.reduce(0) { $0 + $1.balance } }
-        var debtsTotal: Double { debts.reduce(0) { $0 + $1.balance } }
+        var assets: [Line] = []  // deposit and investment accounts
+        var debts: [Line] = []  // credit cards and loans: what's owed
+        var uncounted: [Line] = []  // excluded or unclassifiable accounts
+        var assetsTotal: Double { assets.reduce(0) { $0 + ($1.balance ?? 0) } }
+        var debtsTotal: Double { debts.reduce(0) { $0 + ($1.balance ?? 0) } }
         var total: Double { assetsTotal - debtsTotal }
+        var hasBalances: Bool { (assets + debts).contains { $0.balance != nil } }
     }
 
-    /// Nil until Plaid has sent balances. Accounts at exactly zero are left out as noise.
+    /// Nil when there are no accounts at all.
     var netWorth: NetWorth? {
         var result = NetWorth()
         for connection in connections {
-            for account in connection.accounts ?? [] where !excludedAccounts.contains(account.id) {
-                guard let balance = account.balances?.current, balance != 0 else { continue }
-                let line = NetWorth.Line(account: account, connectionID: connection.id, balance: balance)
+            for account in connection.accounts ?? [] {
+                let line = NetWorth.Line(account: account, connectionID: connection.id, balance: account.balances?.current)
+                if excludedAccounts.contains(account.id) {
+                    result.uncounted.append(line)
+                    continue
+                }
                 switch account.type {
                 case "depository", "investment": result.assets.append(line)
                 case "credit", "loan": result.debts.append(line)
-                default: continue
+                default: result.uncounted.append(line)
                 }
             }
         }
-        guard !result.assets.isEmpty || !result.debts.isEmpty else { return nil }
-        result.assets.sort { $0.balance > $1.balance }
-        result.debts.sort { $0.balance > $1.balance }
+        guard !(result.assets + result.debts + result.uncounted).isEmpty else { return nil }
+        let biggestFirst: (NetWorth.Line, NetWorth.Line) -> Bool = { ($0.balance ?? -.infinity) > ($1.balance ?? -.infinity) }
+        result.assets.sort(by: biggestFirst)
+        result.debts.sort(by: biggestFirst)
         return result
     }
 
@@ -342,7 +395,8 @@ final class Store {
     private(set) var netWorthHistory: [String: Double] = UserDefaults.standard.dictionary(forKey: "netWorthHistory") as? [String: Double] ?? [:]
 
     private func recordNetWorth() {
-        guard let total = netWorth?.total else { return }
+        guard let worth = netWorth, worth.hasBalances else { return }
+        let total = worth.total
         netWorthHistory[Self.dayFormatter.string(from: Date())] = total
         let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-730 * 86400))
         netWorthHistory = netWorthHistory.filter { $0.key >= cutoff }
@@ -351,7 +405,8 @@ final class Store {
 
     /// Change since the oldest figure recorded in the last 30 days, once that's at least a day old.
     func netWorthChange() -> (amount: Double, since: Date)? {
-        guard let current = netWorth?.total else { return nil }
+        guard let worth = netWorth, worth.hasBalances else { return nil }
+        let current = worth.total
         let cutoff = Self.dayFormatter.string(from: referenceDate.addingTimeInterval(-30 * 86400))
         let today = Self.dayFormatter.string(from: referenceDate)
         guard let oldest = netWorthHistory.filter({ $0.key >= cutoff && $0.key < today }).min(by: { $0.key < $1.key }),
@@ -415,22 +470,37 @@ final class Store {
     /// Includes merchants that aren't counted in totals (you still pay them); leaves out excluded accounts
     /// (not your money) and charges dismissed as not recurring.
     var recurring: [Recurring] {
-        if let cached = recurringCache, cached.generation == generation { return cached.items }
-        let items = computeRecurring()
-        recurringCache = (generation, items)
+        _ = generation
+        let entries = index  // first, so the key below uses the version the index was really built from
+        let key = recurringKey()
+        if let cached = recurringCache, cached.key == key { return cached.items }
+        let items = Self.detectRecurring(entries, excluded: excludedAccounts, dismissed: dismissedKeys, now: referenceDate)
+        recurringCache = (key, items)
         return items
     }
 
-    @ObservationIgnored private var recurringCache: (generation: Int, items: [Recurring])?
+    @ObservationIgnored private var recurringCache: (key: Int, items: [Recurring])?
 
-    private func computeRecurring() -> [Recurring] {
+    private var dismissedKeys: Set<String> { Set(dismissedRecurring.map { $0.lowercased() }) }
+
+    /// Everything the recurring result depends on besides the index itself. Time only matters by the day.
+    private func recurringKey(version: Int? = nil) -> Int {
+        var hasher = Hasher()
+        hasher.combine(version ?? builtVersion)
+        hasher.combine(Calendar.current.startOfDay(for: referenceDate))
+        hasher.combine(excludedAccounts)
+        hasher.combine(dismissedRecurring)
+        return hasher.finalize()
+    }
+
+    /// Pure, so it can also run off the main thread.
+    private nonisolated static func detectRecurring(_ entries: [Entry], excluded: Set<String>, dismissed: Set<String>, now: Date) -> [Recurring] {
         let cal = Calendar.current
-        let today = cal.startOfDay(for: referenceDate)
-        let dismissed = Set(dismissedRecurring.map { $0.lowercased() })
+        let today = cal.startOfDay(for: now)
         var byMerchant: [String: [(date: Date, txn: Transaction)]] = [:]
-        for entry in index where entry.txn.pending != true {
+        for entry in entries where entry.txn.pending != true {
             let txn = entry.txn
-            if let accountID = txn.accountId, excludedAccounts.contains(accountID) { continue }
+            if let accountID = txn.accountId, excluded.contains(accountID) { continue }
             guard !dismissed.contains(entry.merchantKey) else { continue }
             byMerchant[entry.merchantKey, default: []].append((entry.date, txn))
         }
@@ -501,6 +571,28 @@ final class Store {
         isRefreshing = false
         recordNetWorth()
         lastRefresh = Date()  // also re-evaluates the day/week/month boundaries
+        await rebuildCaches()
+    }
+
+    /// Rebuilds the index and recurring charges on a background thread after a sync, then swaps them in at once. Until
+    /// then the old ones keep serving, so a sync never freezes the menu. If something changed meanwhile, the result is
+    /// dropped and the next read rebuilds lazily.
+    private func rebuildCaches() async {
+        let version = transactionsVersion
+        guard version != builtVersion else { return }
+        let snapshot = connections
+        let excluded = excludedAccounts
+        let dismissed = dismissedKeys
+        let now = referenceDate
+        let (entries, recurring) = await Task.detached(priority: .utility) { () -> ([Entry], [Recurring]) in
+            let entries = Self.buildIndex(snapshot)
+            return (entries, Self.detectRecurring(entries, excluded: excluded, dismissed: dismissed, now: now))
+        }.value
+        guard version == transactionsVersion else { return }
+        indexCache = entries
+        builtVersion = version
+        recurringCache = (recurringKey(), recurring)
+        generation &+= 1
     }
 
     private func sync(_ id: String) async {
@@ -519,6 +611,7 @@ final class Store {
             // Keep up to 2 years for browsing past periods (the most Plaid provides).
             let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-730 * 86400))
             connections[i].transactions = transactions.filter { $0.value.date >= cutoff }
+            transactionsVersion &+= 1  // the background rebuild after the sync replaces the index; nothing blocks meanwhile
             // Plaid only sends accounts on the first sync, so ask for them each time to keep balances current.
             if let accounts = try? await plaid.accounts(accessToken: connection.accessToken),
                let i = connections.firstIndex(where: { $0.id == id }) {
@@ -686,6 +779,7 @@ final class Store {
         var name = result.institution
         if name == nil { name = try? await plaid.institution(accessToken: accessToken)?.name }
         connections.removeAll { $0.id == itemID }
+        transactionsChanged()
         connections.append(Connection(id: itemID, accessToken: accessToken, institution: name ?? "Bank"))
         save()
 
@@ -712,6 +806,7 @@ final class Store {
         }
         excludedAccounts.subtract(connection.accounts?.map(\.id) ?? [])
         connections.removeAll { $0.id == id }
+        transactionsChanged()
         save()
     }
 
@@ -720,6 +815,7 @@ final class Store {
     private func load() {
         guard let data = try? Data(contentsOf: Self.fileURL) else { return }
         connections = (try? JSONDecoder().decode([Connection].self, from: data)) ?? []
+        transactionsChanged()
         // Caches from older versions lack account IDs or merchant names: drop them and re-sync from scratch once.
         for i in connections.indices where connections[i].accounts == nil
             || connections[i].transactions.values.contains(where: { $0.accountId == nil || $0.name == nil }) {
@@ -733,10 +829,11 @@ final class Store {
     /// Encoding every transaction is slow at scale, so it happens off the main thread on a snapshot of the data.
     private func save() {
         let snapshot = connections
+        let url = Self.fileURL
         Self.saveQueue.async {
             guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            try? data.write(to: Self.fileURL, options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.fileURL.path)
+            try? data.write(to: url, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
     }
 }

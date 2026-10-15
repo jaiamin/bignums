@@ -40,6 +40,9 @@ enum StatusItemMenu {
             ActionMenu.show([
                 .action("Show numbers", checked: !store.hideNumbers) { store.hideNumbers.toggle() },
                 .action("Notify on new charges", checked: store.notifyCharges) { store.notifyCharges.toggle() },
+                .divider,
+                .action("Refresh now") { Task { await store.refresh() } },
+                .action("Quit BigNums") { NSApplication.shared.terminate(nil) },
             ])
             return nil
         }

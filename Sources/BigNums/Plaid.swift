@@ -67,6 +67,7 @@ struct Account: Codable, Identifiable {
     struct Balances: Codable {
         let current: Double?  // what's in a deposit/investment account, or what's owed on a credit/loan account
         let available: Double?
+        let limit: Double?  // credit limit on a card
     }
 }
 
