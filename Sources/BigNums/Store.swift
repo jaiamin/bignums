@@ -881,9 +881,11 @@ struct SpendingQuery {
     var merchant: String?
     var category: String?
     var account: String?  // matched against the card's name, kind and last digits
+    var minAmount: Double?
+    var maxAmount: Double?
 }
 
-enum SpendingGroup { case none, merchant, category, card, day, month }
+enum SpendingGroup { case none, merchant, category, card, day, month, weekday }
 
 struct SpendingSummary {
     struct Group {
@@ -897,6 +899,7 @@ struct SpendingSummary {
     var count = 0
     var groups: [Group] = []
     var largest: [Transaction] = []
+    var listed: [Transaction] = []  // when a listing was asked for: every match, in the order asked, up to the limit
     var notCounted = 0.0  // matched, but at a merchant you've set aside, so left out of the total
 }
 
@@ -908,7 +911,7 @@ extension Store {
 
     /// Counted spending that matches the filters, with the same rules as the totals in the app: set-aside merchants and
     /// excluded accounts don't count, pending charges do.
-    func spendingSummary(_ query: SpendingQuery, groupBy: SpendingGroup, limit: Int) -> SpendingSummary {
+    func spendingSummary(_ query: SpendingQuery, groupBy: SpendingGroup, limit: Int, list: (limit: Int, largestFirst: Bool)? = nil) -> SpendingSummary {
         let entries = index
         let hidden = hiddenKeys
         let accounts = accountsByID
@@ -936,12 +939,16 @@ extension Store {
             categoryNames[categoryKey] = categoryName
             if let categoryNeedle {
                 let name = Self.normalized(categoryName), key = Self.normalized(categoryKey)
-                guard name.contains(categoryNeedle) || key.contains(categoryNeedle) || categoryNeedle.contains(name) else { continue }
+                // "coffee" and "groceries" are Plaid's detailed categories (FOOD_AND_DRINK_COFFEE), not top-level ones.
+                let detailed = Self.normalized(txn.personalFinanceCategory?.detailed ?? "")
+                guard name.contains(categoryNeedle) || key.contains(categoryNeedle) || categoryNeedle.contains(name) || detailed.contains(categoryNeedle) else { continue }
             }
             if let accountNeedle {
                 guard let account,
                       Self.normalized("\(account.displayName) \(account.mask ?? "") \(account.subtype ?? "")").contains(accountNeedle) else { continue }
             }
+            if let minAmount = query.minAmount, txn.amount < minAmount { continue }
+            if let maxAmount = query.maxAmount, txn.amount > maxAmount { continue }
             if hidden.contains(entry.merchantKey) {
                 summary.notCounted += txn.amount
                 continue
@@ -961,6 +968,9 @@ extension Store {
             case .month:
                 let start = cal.dateInterval(of: .month, for: entry.date)?.start ?? entry.date
                 (name, sortKey) = (start.formatted(.dateTime.month(.abbreviated).year()), Self.dayFormatter.string(from: start))
+            case .weekday:
+                let weekday = cal.component(.weekday, from: entry.date)
+                (name, sortKey) = (cal.weekdaySymbols[weekday - 1], String(weekday))
             }
             groups[sortKey, default: .init(name: name, total: 0, count: 0, sortKey: sortKey)].total += txn.amount
             groups[sortKey]!.count += 1
@@ -971,10 +981,102 @@ extension Store {
         default: summary.groups = Array(groups.values.sorted { $0.total > $1.total }.prefix(limit))
         }
         summary.largest = Array(matched.sorted { $0.amount > $1.amount }.prefix(limit))
+        if let list {
+            let ordered = list.largestFirst ? matched.sorted { $0.amount > $1.amount } : matched.sorted { ($0.authorizedDate ?? $0.date) > ($1.authorizedDate ?? $1.date) }
+            summary.listed = Array(ordered.prefix(list.limit))
+        }
         return summary
     }
 
     func displayDate(_ txn: Transaction) -> String {
         Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date)?.formatted(.dateTime.month(.abbreviated).day()) ?? txn.date
+    }
+}
+
+
+// MARK: - Analysis
+
+/// Whether a purchase is something you need or something you chose. A rough guide from Plaid's categories, used to
+/// find what could be cut; it's a heuristic, and the assistant says so.
+enum SpendingNature { case essential, discretionary, other }
+
+extension Transaction {
+    var nature: SpendingNature {
+        let detailed = personalFinanceCategory?.detailed ?? ""
+        let primary = personalFinanceCategory?.primary ?? ""
+        for prefix in ["FOOD_AND_DRINK_GROCERIES", "TRANSPORTATION_GAS", "TRANSPORTATION_PUBLIC_TRANSIT", "GENERAL_SERVICES_INSURANCE",
+                       "GENERAL_SERVICES_EDUCATION", "GOVERNMENT_AND_NON_PROFIT"] where detailed.hasPrefix(prefix) { return .essential }
+        switch primary {
+        case "RENT_AND_UTILITIES", "MEDICAL": return .essential
+        case "FOOD_AND_DRINK", "ENTERTAINMENT", "GENERAL_MERCHANDISE", "PERSONAL_CARE", "TRAVEL", "BANK_FEES": return .discretionary  // home improvement is lumpy, not a habit
+        case "TRANSPORTATION": return detailed.hasPrefix("TRANSPORTATION_TAXIS") ? .discretionary : .essential
+        default: return .other
+        }
+    }
+}
+
+/// A counted purchase with its date already parsed.
+struct Purchase {
+    let date: Date
+    let merchant: String
+    let txn: Transaction
+}
+
+/// The whole calendar months we have complete data for, plus the month in progress.
+struct MonthWindow {
+    let complete: [Date]  // first day of each full month, oldest first
+    let current: Date  // first day of this month
+    var first: Date { complete.first ?? current }
+}
+
+extension Store {
+    /// Up to `maxMonths` full months before this one. A month the history only partly covers isn't full, so it's left out.
+    func monthWindow(maxMonths: Int) -> MonthWindow {
+        let cal = Calendar.current
+        let current = cal.dateInterval(of: .month, for: referenceDate)?.start ?? cal.startOfDay(for: referenceDate)
+        var complete: [Date] = []
+        if let historyStart {
+            for k in 1...max(maxMonths, 1) {
+                guard let start = cal.date(byAdding: .month, value: -k, to: current), start >= historyStart else { break }
+                complete.append(start)
+            }
+        }
+        return MonthWindow(complete: complete.reversed(), current: current)
+    }
+
+    /// Purchases that count toward spending (set-aside merchants and excluded accounts left out), oldest first.
+    func countedPurchases(from start: Date, to end: Date = .distantFuture) -> [Purchase] {
+        let entries = index
+        let hidden = hiddenKeys
+        let now = referenceDate
+        var result: [Purchase] = []
+        var i = lowerBound(entries, start)
+        while i < entries.count, entries[i].date < end {
+            let entry = entries[i]
+            i += 1
+            guard entry.date <= now, !hidden.contains(entry.merchantKey) else { continue }
+            if let id = entry.txn.accountId, excludedAccounts.contains(id) { continue }
+            result.append(Purchase(date: entry.date, merchant: entry.txn.merchant, txn: entry.txn))
+        }
+        return result
+    }
+
+    /// Money that came in as income during these months, or nil if none was found. Only deposits into checking and
+    /// savings count: a payment arriving on a credit card account is Plaid's "income" label on what is really a bill payment.
+    func income(during months: [Date]) -> Double? {
+        let cal = Calendar.current
+        let wanted = Set(months.map { cal.dateComponents([.year, .month], from: $0) })
+        let accounts = accountsByID
+        var total = 0.0
+        for connection in connections {
+            for txn in connection.transactions.values where txn.amount < 0 && txn.personalFinanceCategory?.primary == "INCOME" {
+                guard let id = txn.accountId, accounts[id]?.type == "depository" else { continue }
+                if excludedAccounts.contains(id) { continue }
+                guard let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date),
+                      wanted.contains(cal.dateComponents([.year, .month], from: date)) else { continue }
+                total -= txn.amount
+            }
+        }
+        return total > 0 ? total : nil
     }
 }

@@ -13,6 +13,11 @@ enum Snapshot {
             for style in MenuBarStyle.allCases { print("\(style.title): \(store.label(for: style))") }
             exit(0)
         }
+        if env["BIGNUMS_INSIGHTS"] != nil, #available(macOS 26.0, *) {  // the raw analysis, to check the numbers behind the answers
+            let assistant = AssistantProvider.assistant(for: Store(autoRefresh: false))
+            for topic in [InsightTopic.savingsIdeas, .impulseSpending, .trends, .budget] { print("== \(topic)\n\(assistant.insights(topic, groupBy: nil))\n") }
+            exit(0)
+        }
         guard let path = env["BIGNUMS_SNAPSHOT"] else { return }
         if let period = env["BIGNUMS_PERIOD"] { UserDefaults.standard.set(period, forKey: "period") }
         UserDefaults.standard.set(env["BIGNUMS_TAB"] ?? "spend", forKey: "tab")

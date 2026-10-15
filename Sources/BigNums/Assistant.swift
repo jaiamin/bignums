@@ -58,6 +58,7 @@ final class Assistant {
     @ObservationIgnored private var session: LanguageModelSession?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var toolsUsed: [String] = []
+    @ObservationIgnored private(set) var currentQuestion = ""
 
     init(store: Store) { self.store = store }
 
@@ -96,6 +97,7 @@ final class Assistant {
         isResponding = true
         activity = "Thinking…"
         toolsUsed = []
+        currentQuestion = question
         defer {
             isResponding = false
             activity = nil
@@ -133,6 +135,7 @@ final class Assistant {
         case "recurring": ["Did any of these go up in price?", "What's due in the next 7 days?"]
         case "usualSpending": ["Why is it different from usual?"]
         case "whatChanged": ["Break that down by category", "What was my biggest purchase this month?"]
+        case "insights": ["Which one should I cut first?", "Show the trend over past months"]
         default: []
         }
     }
@@ -153,23 +156,31 @@ final class Assistant {
         You are the assistant inside BigNums, a personal finance app that lives in the menu bar. Today is \(today). \
         All amounts are US dollars.
 
-        You answer questions about the user's own spending, bills, balances and net worth, using only your tools.
+        You can answer almost anything about the user's money: spending, purchases, merchants, categories, trends, \
+        habits, impulse spending, what to cut, budgets, income, savings, subscriptions, bills, balances and net worth. \
+        You do it with your tools, which hold all of the user's data.
 
         Rules:
-        - Call a tool for every amount, date or list. Never guess, estimate or do arithmetic yourself. If you need a \
-        total or a difference, call a tool again, or use a figure a tool already returned.
+        - Call a tool for every amount, date or list. Never guess, estimate or do arithmetic yourself.
+        - For questions about saving money, what to cut, budgeting, habits, patterns, trends, impulse spending or advice, \
+        call the insights tool, then answer decisively: name the specific thing, give its monthly amount and its trend, \
+        and suggest one concrete step. Don't give generic advice that the numbers don't support.
+        - Never say you can't do something, and never ask the user whether they'd like you to. Do the closest useful \
+        analysis with your tools and answer with it.
+        - For "over $X" set minAmount to X; for "under $X" set maxAmount.
         - If the user gives no time range, use thisMonth, and say that you did. Words like "total", "ever", "overall" or \
         "all time" mean allTime.
+        - Never reuse figures from your earlier answers: call a tool again for every question.
+        - Each question stands on its own: don't reuse amounts, merchants or categories from earlier questions unless the user refers back to them.
         - Only state facts that appear in a tool's result. If something isn't in the result, such as a credit limit, say \
         you don't have that information. Never fill gaps with assumptions.
-        - Quote the tool's figures exactly, and mention the time range you used.
-        - When you name merchants, categories or accounts, include their amounts.
-        - Answer in one to three short sentences, or a short list. Plain text only: no markdown, no headings.
-        - If a tool finds nothing, say so plainly.
-        - If the question isn't about the user's money, say you can only help with their finances.
+        - Quote the tool's figures exactly, and mention the time range you used. When you name merchants, categories or \
+        accounts, include their amounts.
+        - Keep answers short: a few sentences, or a short list. Plain text only: no markdown, no headings.
+        - If a tool finds nothing, say so plainly. If the question isn't about the user's money, say you only help with their finances.
         """
         let tools: [any Tool] = [SpendingTool(assistant: self), BalancesTool(assistant: self),
-                                 RecurringTool(assistant: self), UsualSpendingTool(assistant: self), ChangesTool(assistant: self)]
+                                 RecurringTool(assistant: self), UsualSpendingTool(assistant: self), ChangesTool(assistant: self), InsightsTool(assistant: self)]
         return LanguageModelSession(model: .default, tools: tools, instructions: instructions)
     }
 }
@@ -185,7 +196,13 @@ enum AssistantPeriod: String {
 @available(macOS 26.0, *)
 @Generable
 enum AssistantGroup: String {
-    case merchant, category, card, day, month
+    case merchant, category, card, day, month, weekday
+}
+
+@available(macOS 26.0, *)
+@Generable
+enum PurchaseOrder: String {
+    case newest, largest
 }
 
 @available(macOS 26.0, *)
@@ -195,12 +212,18 @@ struct SpendingArguments {
     var period: AssistantPeriod
     @Guide(description: "Only this merchant, for example DoorDash. Leave empty for all merchants.")
     var merchant: String?
-    @Guide(description: "Only this category, for example Food & drink, Transportation or General merchandise. Leave empty for all.")
+    @Guide(description: "Only this kind of spending. Prefer the most specific word the user used, like coffee, groceries, restaurants or gas; otherwise one of Food & drink, General merchandise, Transportation, Travel, Entertainment, Rent & utilities, Medical, Personal care, Home improvement, Bank fees. Leave empty for all.")
     var category: String?
     @Guide(description: "Only this card or account, matched by its name or last four digits. Leave empty for all.")
     var account: String?
-    @Guide(description: "Break the total down by merchant, category, card, day or month. Leave empty for just the total.")
+    @Guide(description: "Break the total down by merchant, category, card, day, month or weekday (day of the week). Leave empty for just the total.")
     var groupBy: AssistantGroup?
+    @Guide(description: "Only purchases of at least this many dollars. Set it only when the current question names an amount, like \"over $100\".")
+    var minAmount: Double?
+    @Guide(description: "Only purchases of at most this many dollars. Leave empty unless the question says \"under\" an amount.")
+    var maxAmount: Double?
+    @Guide(description: "Set this to list individual purchases, newest first or largest first. Leave empty for just totals.")
+    var list: PurchaseOrder?
     @Guide(description: "Exact start date as yyyy-MM-dd. Only for a custom range the periods can't express; overrides period.")
     var from: String?
     @Guide(description: "Exact end date as yyyy-MM-dd, inclusive. Use together with from.")
@@ -214,10 +237,17 @@ struct SpendingTool: Tool {
     let description = """
         Looks up how much the user spent. Filter by time range, merchant, category or card, and optionally break the total \
         down by merchant, category, card, day or month. Also lists the largest purchases. Use it for any question about \
-        spending, purchases or what something cost.
+        spending, purchases or what something cost. For "over $100" use minAmount, and set list to largest to see the \
+        individual purchases.
         """
 
     func call(arguments: SpendingArguments) async throws -> String {
+        #if DEBUG
+        let minText = (arguments.minAmount.map { String($0) } ?? "-") + "/max " + (arguments.maxAmount.map { String($0) } ?? "-")
+        let listText = arguments.list.map { String(describing: $0) } ?? "-"
+        let groupText = arguments.groupBy.map { String(describing: $0) } ?? "-"
+        print("   [spending] period=\(arguments.period) merchant=\(arguments.merchant ?? "-") min=\(minText) list=\(listText) groupBy=\(groupText)")
+        #endif
         await assistant.noteTool("spending")
         await assistant.setActivity("Checking your spending…")
         return await assistant.spending(arguments)
@@ -245,7 +275,7 @@ struct BalancesTool: Tool {
 struct RecurringTool: Tool {
     let assistant: Assistant
     let name = "recurring"
-    let description = "Lists recurring charges: subscriptions and bills, how much each costs, and when each is due next."
+    let description = "Lists recurring charges: subscriptions and bills, how much each costs, and when each is due next. To decide which to cancel, use insights instead."
 
     @Generable struct Arguments {
         @Guide(description: "Only charges due within this many days from today: 7 for \"this week\", 30 for \"this month\". Leave empty for all.")
@@ -264,8 +294,8 @@ struct UsualSpendingTool: Tool {
     let assistant: Assistant
     let name = "usualSpending"
     let description = """
-        Compares what the user has spent so far today, this week or this month with what they usually spend by this point. \
-        Use it for "am I spending more than usual?" questions.
+        Compares the user's total spending so far today, this week or this month with what they usually spend by this \
+        point. Use it only for "am I spending more than usual overall?". Not for a specific category or merchant.
         """
 
     @Generable struct Arguments {
@@ -353,16 +383,25 @@ extension Assistant {
             guard let text = text?.trimmingCharacters(in: .whitespaces), !text.isEmpty else { return nil }
             return text
         }
-        let query = SpendingQuery(interval: interval, merchant: clean(args.merchant), category: clean(args.category), account: clean(args.account))
+        let bounds = amountBounds(args.minAmount, args.maxAmount)
+        let query = SpendingQuery(interval: interval, merchant: clean(args.merchant), category: clean(args.category), account: clean(args.account),
+                                  minAmount: bounds.min, maxAmount: bounds.max)
         let group: SpendingGroup = switch args.groupBy {
         case .merchant: .merchant
         case .category: .category
         case .card: .card
         case .day: .day
         case .month: .month
+        case .weekday: .weekday
         case nil: .none
         }
-        let summary = store.spendingSummary(query, groupBy: group, limit: group == .day || group == .month ? 14 : 8)
+        // The model rarely fills in `list`, so any filtered question gets its matching purchases anyway: largest first for
+        // amount filters, newest first otherwise.
+        let filtered = query.merchant != nil || query.category != nil || query.account != nil
+        let bounded = query.minAmount != nil || query.maxAmount != nil
+        let order: PurchaseOrder? = args.list ?? (bounded ? .largest : filtered ? .newest : nil)
+        let listing = order.map { (limit: 10, largestFirst: $0 == .largest) }
+        let summary = store.spendingSummary(query, groupBy: group, limit: group == .day || group == .month ? 14 : 8, list: listing)
 
         let filters = [query.merchant, query.category, query.account].compactMap { $0 }.joined(separator: ", ")
         var lines = ["Spent \(Self.money(summary.total)) across \(summary.count) purchase\(summary.count == 1 ? "" : "s") in \(label)"
@@ -371,7 +410,13 @@ extension Assistant {
             let name = args.groupBy.map { "\($0)".capitalized } ?? ""
             lines.append("By \(name.lowercased()): " + summary.groups.map { "\($0.name) \(Self.money($0.total)) (\($0.count))" }.joined(separator: "; ") + ".")
         }
-        if !summary.largest.isEmpty {
+        if !summary.listed.isEmpty {
+            let accounts = store.accountsByID
+            lines.append("Purchases (\(order == .largest ? "largest" : "newest") first, \(summary.listed.count) of \(summary.count)): " + summary.listed.map { txn in
+                let card = txn.accountId.flatMap { accounts[$0] }.map { " on \($0.shortName)" } ?? ""
+                return "\(store.displayDate(txn)) \(txn.merchant) \(Self.money(txn.amount))\(card)"
+            }.joined(separator: "; ") + ".")
+        } else if !summary.largest.isEmpty {
             let accounts = store.accountsByID
             lines.append("Largest: " + summary.largest.prefix(5).map { txn in
                 let card = txn.accountId.flatMap { accounts[$0] }.map { " on \($0.shortName)" } ?? ""
@@ -382,6 +427,16 @@ extension Assistant {
             lines.append("Not included: \(Self.money(summary.notCounted)) more at merchants the user has set aside, which the app doesn't count.")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// The model fills numeric fields unreliably: it copies one number into both bounds, reuses an amount from an earlier
+    /// question, or sends 0 for "none". So an amount filter only counts if the current question actually has a number in it.
+    private func amountBounds(_ minimum: Double?, _ maximum: Double?) -> (min: Double?, max: Double?) {
+        guard currentQuestion.contains(where: \.isNumber) else { return (nil, nil) }
+        let low = minimum.flatMap { $0 > 0 ? $0 : nil }
+        var high = maximum.flatMap { $0 > 0 ? $0 : nil }
+        if let low, let high0 = high, high0 <= low { high = nil }
+        return (low, high)
     }
 
     func balances() -> String {
@@ -423,7 +478,9 @@ extension Assistant {
             let change = item.change.map { $0 > 0 ? ", up \(Self.money($0)) from before" : ", down \(Self.money(-$0))" } ?? ""
             return "\(item.name) \(Self.money(item.amount)) \(item.cadence.label.lowercased()), next \(item.next.formatted(.dateTime.month(.abbreviated).day()))\(card)\(change)"
         }
-        return "Recurring charges cost about \(Self.money(monthly)) a month in total.\n" + (dueWithinDays == nil ? "" : "Due soon: ") + list.joined(separator: "; ") + "."
+        let byCost = store.recurring.sorted { $0.monthlyCost > $1.monthlyCost }.prefix(5).map { "\($0.name) \(Self.money($0.monthlyCost))" }
+        return "Recurring charges cost about \(Self.money(monthly)) a month in total.\n" + (dueWithinDays == nil ? "" : "Due soon: ") + list.joined(separator: "; ") + ".\n"
+            + "Most expensive first: " + byCost.joined(separator: "; ") + "."
     }
 
     func usual(_ period: AssistantPeriod) -> String {
