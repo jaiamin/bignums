@@ -115,6 +115,7 @@ struct Recurring: Identifiable {
     let next: Date
     let change: Double?  // latest charge minus the one before, when the price moved
     let sample: Transaction  // supplies the logo and category icon
+    let account: String?  // card/account the latest charge was on, e.g. "Sapphire ••1234"
     var id: String { "\(name.lowercased())-\(amount)" }
 
     var monthlyCost: Double {
@@ -151,6 +152,11 @@ final class Store {
     /// Merchants the user said aren't recurring charges (a false match). Only affects Recurring. Stored in UserDefaults.
     private(set) var dismissedRecurring: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "dismissedRecurring") ?? []) {
         didSet { UserDefaults.standard.set(Array(dismissedRecurring), forKey: "dismissedRecurring") }
+    }
+
+    /// Menu bar shows a placeholder instead of the amounts (for screen sharing, or just privacy). Stored in UserDefaults.
+    var hideNumbers = UserDefaults.standard.bool(forKey: "hideNumbers") {
+        didSet { UserDefaults.standard.set(hideNumbers, forKey: "hideNumbers") }
     }
 
     private var plaid: Plaid?
@@ -244,6 +250,12 @@ final class Store {
 
     // MARK: Recurring
 
+    /// "Name ••1234" for an account ID, so a charge can be traced to the card it hit.
+    private func accountLabel(_ accountID: String?) -> String? {
+        guard let accountID, let account = connections.lazy.compactMap({ $0.accounts?.first { $0.id == accountID } }).first else { return nil }
+        return account.mask.map { "\(account.name) ••\($0)" } ?? account.name
+    }
+
     /// Charges that repeat at a steady interval with a steady price, still active, soonest first.
     /// Includes merchants that aren't counted in totals (you still pay them); leaves out excluded accounts
     /// (not your money) and charges dismissed as not recurring.
@@ -286,7 +298,8 @@ final class Store {
                 while next < today { next = cadence.advance(next) }
                 let change = amounts[amounts.count - 1] - amounts[amounts.count - 2]
                 result.append(Recurring(name: last.txn.merchant, amount: last.txn.amount, cadence: cadence, next: next,
-                                        change: abs(change) >= 0.5 ? change : nil, sample: last.txn))
+                                        change: abs(change) >= 0.5 ? change : nil, sample: last.txn,
+                                        account: accountLabel(last.txn.accountId)))
             }
         }
         return result.sorted { $0.next < $1.next }
@@ -294,7 +307,8 @@ final class Store {
 
     /// Menu bar text: always the current day, week and month, whatever the menu is browsing.
     var label: String {
-        Period.allCases
+        if hideNumbers { return Period.allCases.map { _ in "$•••" }.joined(separator: " | ") }
+        return Period.allCases
             .map { Self.compactMoney(breakdown($0.interval(offset: 0, from: referenceDate)).total) }
             .joined(separator: " | ")
     }

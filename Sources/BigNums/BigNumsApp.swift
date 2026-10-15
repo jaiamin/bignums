@@ -1,3 +1,4 @@
+import Charts
 import SwiftUI
 
 @main
@@ -8,7 +9,9 @@ struct BigNumsApp: App {
         #if DEBUG
         Snapshot.renderIfRequested()
         #endif
-        _store = State(initialValue: Store())
+        let store = Store()
+        _store = State(initialValue: store)
+        StatusItemMenu.install(store)
     }
 
     var body: some Scene {
@@ -30,6 +33,8 @@ struct MenuView: View {
     @AppStorage("period") private var period: Period = .month
     @AppStorage("accountsExpanded") private var accountsExpanded = false
     @AppStorage("recurringExpanded") private var recurringExpanded = false
+    @AppStorage("trendExpanded") private var trendExpanded = false
+    @State private var trendSelection: Date?
     @State private var offset = 0  // 0 = current period, -1 = previous, ...
     @State private var removing: String?  // connection awaiting remove confirmation
     @State private var window: NSWindow?
@@ -50,6 +55,8 @@ struct MenuView: View {
                     .padding(.top, 18)
                 spending(breakdown)
                     .padding(.top, 22)
+                trendSection(interval, breakdown)
+                    .padding(.top, 18)
                 recurringSection
                     .padding(.top, 18)
                 accounts(breakdown)
@@ -237,6 +244,97 @@ struct MenuView: View {
         }
     }
 
+    // MARK: Trend
+
+    private var trendCount: Int {
+        switch period {
+        case .day: 14
+        case .week: 8
+        case .month: 6
+        }
+    }
+
+    /// Spending in each of the last few days/weeks/months, ending at the one being viewed. The current one is partial.
+    private func trendPoints(_ interval: DateInterval) -> [(start: Date, total: Double)] {
+        guard let historyStart = store.historyStart else { return [] }
+        return (-(trendCount - 1)...0).compactMap { step in
+            let slot = period.interval(offset: offset + step, from: store.referenceDate)
+            guard slot.end > historyStart else { return nil }
+            return (slot.start, store.breakdown(slot).total)
+        }
+    }
+
+    private func trendSection(_ interval: DateInterval, _ breakdown: Breakdown) -> some View {
+        let points = trendPoints(interval)
+        let average = points.isEmpty ? 0 : points.reduce(0) { $0 + $1.total } / Double(points.count)
+        let unit = period == .month ? "mo" : period == .week ? "wk" : "day"
+        return VStack(alignment: .leading, spacing: 0) {
+            CollapsibleHeader(
+                title: "Trend",
+                value: points.count > 1 ? "avg \(Store.money(average))/\(unit)" : "",
+                alert: nil,
+                alertColor: .secondary,
+                expanded: $trendExpanded
+            )
+            if trendExpanded {
+                if points.count < 2 {
+                    Note("Not enough history yet")
+                } else {
+                    trendChart(points, average: average, selected: interval.start)
+                }
+            }
+        }
+    }
+
+    private func trendChart(_ points: [(start: Date, total: Double)], average: Double, selected: Date) -> some View {
+        let hovered = trendSelection.flatMap { date in points.min { abs($0.start.timeIntervalSince(date)) < abs($1.start.timeIntervalSince(date)) } }
+        let shown = hovered ?? points.first { $0.start == selected }
+        let format: Date.FormatStyle = switch period {
+        case .day: .dateTime.month(.abbreviated).day()
+        case .week: .dateTime.month(.abbreviated).day()
+        case .month: .dateTime.month(.abbreviated)
+        }
+        return VStack(alignment: .leading, spacing: 12) {
+            Text(shown.map { "\(period == .week ? "Week of " : "")\($0.start.formatted(format)): \(Store.money($0.total))" } ?? " ")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Chart {
+                ForEach(points, id: \.start) { point in
+                    LineMark(x: .value("Date", point.start), y: .value("Spent", point.total))
+                        .foregroundStyle(Color.accentColor)
+                    AreaMark(x: .value("Date", point.start), y: .value("Spent", point.total))
+                        .foregroundStyle(Color.accentColor.opacity(0.12))
+                }
+                RuleMark(y: .value("Average", average))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .foregroundStyle(.secondary.opacity(0.6))
+                if let shown {
+                    PointMark(x: .value("Date", shown.start), y: .value("Spent", shown.total))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .chartXSelection(value: $trendSelection)
+            .chartXScale(range: .plotDimension(startPadding: 12, endPadding: 32))
+            .chartXAxis {
+                if period == .month {
+                    AxisMarks(values: points.map(\.start)) { _ in AxisTick(); AxisValueLabel(format: format, anchor: .top).font(.system(size: 10)) }
+                } else {
+                    AxisMarks(values: .automatic(desiredCount: 4)) { _ in AxisValueLabel(format: format).font(.system(size: 10)) }
+                }
+            }
+            .chartYAxis {
+                AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { value in
+                    AxisGridLine()
+                    AxisValueLabel { if let v = value.as(Double.self) { Text(Store.compactMoney(v)).font(.system(size: 10)) } }
+                }
+            }
+            .frame(height: 110)
+        }
+        .padding(.horizontal, Self.inset)
+        .padding(.top, 8)
+    }
+
     // MARK: Recurring
 
     @ViewBuilder
@@ -268,6 +366,7 @@ struct MenuView: View {
     private func recurringRow(_ item: Recurring) -> some View {
         let next = item.next.formatted(.dateTime.month(.abbreviated).day())
         let counted = store.isCounted(item.name)
+        let via = item.account.map { " · \($0)" } ?? ""
         return Button {
             ActionMenu.show([.action("Not a recurring charge") { store.dismissRecurring(item.name) }])
         } label: {
@@ -275,13 +374,13 @@ struct MenuView: View {
                 MerchantIcon(logo: item.sample.logoUrl.flatMap(URL.init(string:)), symbol: item.sample.symbol)
             } detail: {
                 if let change = item.change, change > 0 {
-                    Text("Went up \(change.formatted(.currency(code: "USD"))), next \(next)").foregroundStyle(.orange)
+                    Text("Went up \(change.formatted(.currency(code: "USD"))), next \(next)\(via)").foregroundStyle(.orange)
                 } else if let change = item.change {
-                    Text("Went down \((-change).formatted(.currency(code: "USD"))), next \(next)")
+                    Text("Went down \((-change).formatted(.currency(code: "USD"))), next \(next)\(via)")
                 } else if !counted {
-                    Text("\(item.cadence.label), not counted in totals")
+                    Text("\(item.cadence.label), not counted in totals\(via)")
                 } else {
-                    Text("\(item.cadence.label), next \(next)")
+                    Text("\(item.cadence.label), next \(next)\(via)")
                 }
             }
             .opacity(counted ? 1 : 0.5)
@@ -762,6 +861,21 @@ private struct RowButtonStyle: ButtonStyle {
                 )
                 .opacity(isEnabled ? 1 : 0.5)
                 .onHover { hovering = $0 }
+        }
+    }
+}
+
+/// MenuBarExtra has no right-click hook, so watch for right clicks that land on the menu bar item's own window.
+@MainActor
+private enum StatusItemMenu {
+    private static var monitor: Any?
+
+    static func install(_ store: Store) {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
+            guard let window = event.window, window.className.contains("StatusBar") else { return event }
+            ActionMenu.show([.action(store.hideNumbers ? "Show numbers" : "Hide numbers") { store.hideNumbers.toggle() }])
+            return nil
         }
     }
 }
