@@ -116,7 +116,6 @@ struct Recurring: Identifiable {
     let next: Date
     let change: Double?  // latest charge minus the one before, when the price moved
     let sample: Transaction  // supplies the logo and category icon
-    let account: String?  // card/account the latest charge was on, e.g. "Sapphire ••1234"
     var id: String { "\(name.lowercased())-\(amount)" }
 
     var monthlyCost: Double {
@@ -135,14 +134,20 @@ extension Transaction {
 
 @MainActor @Observable
 final class Store {
-    private(set) var connections: [Connection] = []
+    private(set) var connections: [Connection] = [] {
+        didSet { indexCache = nil; generation &+= 1 }
+    }
+    /// Bumped whenever something the derived data depends on changes, so cached results know they're stale.
+    private var generation = 0
     private(set) var isLinking = false
     private(set) var isRefreshing = false
-    private(set) var lastRefresh: Date?
+    private(set) var lastRefresh: Date? {
+        didSet { generation &+= 1 }
+    }
     var message: String?
     /// Account IDs left out of the totals. Stored in UserDefaults.
     private(set) var excludedAccounts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "excludedAccounts") ?? []) {
-        didSet { UserDefaults.standard.set(Array(excludedAccounts), forKey: "excludedAccounts") }
+        didSet { UserDefaults.standard.set(Array(excludedAccounts), forKey: "excludedAccounts"); generation &+= 1 }
     }
     /// Merchants left out of spending totals (e.g. rent, which dwarfs everything else). They still appear in
     /// Recurring, since you still pay them. Stored in UserDefaults.
@@ -152,7 +157,7 @@ final class Store {
     private var hiddenKeys: Set<String> { Set(hiddenMerchants.map { $0.lowercased() }) }
     /// Merchants the user said aren't recurring charges (a false match). Only affects Recurring. Stored in UserDefaults.
     private(set) var dismissedRecurring: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "dismissedRecurring") ?? []) {
-        didSet { UserDefaults.standard.set(Array(dismissedRecurring), forKey: "dismissedRecurring") }
+        didSet { UserDefaults.standard.set(Array(dismissedRecurring), forKey: "dismissedRecurring"); generation &+= 1 }
     }
 
     /// Menu bar shows a placeholder instead of the amounts (for screen sharing, or just privacy). Stored in UserDefaults.
@@ -222,15 +227,63 @@ final class Store {
         connections.flatMap(\.transactions.values).map(\.date).min().flatMap(Self.dayFormatter.date(from:))
     }
 
+    /// One spending-relevant charge with its date already parsed, so period math never touches strings.
+    private struct Entry {
+        let date: Date
+        let merchantKey: String  // lowercased merchant, as hiding and recurring match on it
+        let txn: Transaction
+    }
+
+    /// Every charge that could count toward spending (money out, not a transfer or income), oldest first. Built once
+    /// per change to the data; with thousands of transactions this keeps each period lookup to a binary search plus
+    /// the handful of charges inside it.
+    @ObservationIgnored private var indexCache: [Entry]?
+    @ObservationIgnored private var dayCache: [String: Date] = [:]
+
+    private var index: [Entry] {
+        if let indexCache { return indexCache }
+        var entries: [Entry] = []
+        for connection in connections {
+            for txn in connection.transactions.values where txn.amount > 0 {
+                if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
+                let day = txn.authorizedDate ?? txn.date
+                let date: Date
+                if let cached = dayCache[day] {
+                    date = cached
+                } else if let parsed = Self.dayFormatter.date(from: day) {
+                    dayCache[day] = parsed
+                    date = parsed
+                } else {
+                    continue
+                }
+                entries.append(Entry(date: date, merchantKey: txn.merchant.lowercased(), txn: txn))
+            }
+        }
+        entries.sort { $0.date < $1.date }
+        indexCache = entries
+        return entries
+    }
+
+    /// Position of the first entry dated at or after `date`.
+    private func lowerBound(_ entries: [Entry], _ date: Date) -> Int {
+        var low = 0, high = entries.count
+        while low < high {
+            let mid = (low + high) / 2
+            if entries[mid].date < date { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+
     func breakdown(_ interval: DateInterval) -> Breakdown {
         let now = referenceDate
         let hidden = hiddenKeys
+        let entries = index
         var result = Breakdown()
-        for txn in connections.flatMap(\.transactions.values) where txn.amount > 0 {
-            if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
-            guard let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date),
-                  interval.start <= date, date < interval.end, date <= now else { continue }
-            let isHidden = hidden.contains(txn.merchant.lowercased())
+        var i = lowerBound(entries, interval.start)
+        while i < entries.count, entries[i].date < interval.end, entries[i].date <= now {
+            let txn = entries[i].txn
+            let isHidden = hidden.contains(entries[i].merchantKey)
+            i += 1
             if let accountID = txn.accountId {
                 if !isHidden { result.byAccount[accountID, default: 0] += txn.amount }
                 if excludedAccounts.contains(accountID) { continue }
@@ -270,16 +323,24 @@ final class Store {
     /// Includes merchants that aren't counted in totals (you still pay them); leaves out excluded accounts
     /// (not your money) and charges dismissed as not recurring.
     var recurring: [Recurring] {
+        if let cached = recurringCache, cached.generation == generation { return cached.items }
+        let items = computeRecurring()
+        recurringCache = (generation, items)
+        return items
+    }
+
+    @ObservationIgnored private var recurringCache: (generation: Int, items: [Recurring])?
+
+    private func computeRecurring() -> [Recurring] {
         let cal = Calendar.current
         let today = cal.startOfDay(for: referenceDate)
         let dismissed = Set(dismissedRecurring.map { $0.lowercased() })
         var byMerchant: [String: [(date: Date, txn: Transaction)]] = [:]
-        for txn in connections.flatMap(\.transactions.values) where txn.amount > 0 && txn.pending != true {
-            if let category = txn.personalFinanceCategory?.primary, Self.ignoredCategories.contains(category) { continue }
+        for entry in index where entry.txn.pending != true {
+            let txn = entry.txn
             if let accountID = txn.accountId, excludedAccounts.contains(accountID) { continue }
-            let key = txn.merchant.lowercased()
-            guard !dismissed.contains(key), let date = Self.dayFormatter.date(from: txn.authorizedDate ?? txn.date) else { continue }
-            byMerchant[key, default: []].append((date, txn))
+            guard !dismissed.contains(entry.merchantKey) else { continue }
+            byMerchant[entry.merchantKey, default: []].append((entry.date, txn))
         }
 
         var result: [Recurring] = []
@@ -308,8 +369,7 @@ final class Store {
                 while next < today { next = cadence.advance(next) }
                 let change = amounts[amounts.count - 1] - amounts[amounts.count - 2]
                 result.append(Recurring(name: last.txn.merchant, amount: last.txn.amount, cadence: cadence, next: next,
-                                        change: abs(change) >= 0.5 ? change : nil, sample: last.txn,
-                                        account: accountLabel(last.txn.accountId)))
+                                        change: abs(change) >= 0.5 ? change : nil, sample: last.txn))
             }
         }
         return result.sorted { $0.next < $1.next }
@@ -357,13 +417,15 @@ final class Store {
             guard let i = connections.firstIndex(where: { $0.id == id }) else { return }
             // The first sync loads history, which isn't news.
             if connection.cursor != nil { notifyNewCharges(result, existing: connections[i].transactions) }
-            for txn in result.added { connections[i].transactions[txn.transactionId] = txn }
-            for txnID in result.removed { connections[i].transactions[txnID] = nil }
+            // Edit a copy and assign once: every write to `connections` invalidates the derived data.
+            var transactions = connections[i].transactions
+            for txn in result.added { transactions[txn.transactionId] = txn }
+            for txnID in result.removed { transactions[txnID] = nil }
             if let accounts = result.accounts { connections[i].accounts = accounts }
             if !result.cursor.isEmpty { connections[i].cursor = result.cursor }  // empty = data not ready yet
             // Keep up to 2 years for browsing past periods (the most Plaid provides).
             let cutoff = Self.dayFormatter.string(from: Date().addingTimeInterval(-730 * 86400))
-            connections[i].transactions = connections[i].transactions.filter { $0.value.date >= cutoff }
+            connections[i].transactions = transactions.filter { $0.value.date >= cutoff }
             // Fetch the account list if we've never received one (or saved it before account types were stored).
             if connections[i].accounts.map({ $0.isEmpty || $0.contains { $0.type == nil } }) ?? true, let accounts = try? await plaid.accounts(accessToken: connection.accessToken),
                let i = connections.firstIndex(where: { $0.id == id }) {
@@ -573,9 +635,15 @@ final class Store {
         }
     }
 
+    private static let saveQueue = DispatchQueue(label: "bignums.save", qos: .utility)
+
+    /// Encoding every transaction is slow at scale, so it happens off the main thread on a snapshot of the data.
     private func save() {
-        guard let data = try? JSONEncoder().encode(connections) else { return }
-        try? data.write(to: Self.fileURL, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.fileURL.path)
+        let snapshot = connections
+        Self.saveQueue.async {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: Self.fileURL, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.fileURL.path)
+        }
     }
 }

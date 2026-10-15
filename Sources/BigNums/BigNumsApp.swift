@@ -34,7 +34,6 @@ struct MenuView: View {
     @AppStorage("accountsExpanded") private var accountsExpanded = false
     @AppStorage("recurringExpanded") private var recurringExpanded = false
     @AppStorage("trendExpanded") private var trendExpanded = false
-    @State private var trendSelection: Date?
     @State private var offset = 0  // 0 = current period, -1 = previous, ...
     @State private var removing: String?  // connection awaiting remove confirmation
     @State private var window: NSWindow?
@@ -280,59 +279,10 @@ struct MenuView: View {
                 if points.count < 2 {
                     Note("Not enough history yet")
                 } else {
-                    trendChart(points, average: average, selected: interval.start)
+                    TrendChart(points: points, average: average, selected: interval.start, period: period)
                 }
             }
         }
-    }
-
-    private func trendChart(_ points: [(start: Date, total: Double)], average: Double, selected: Date) -> some View {
-        let hovered = trendSelection.flatMap { date in points.min { abs($0.start.timeIntervalSince(date)) < abs($1.start.timeIntervalSince(date)) } }
-        let shown = hovered ?? points.first { $0.start == selected }
-        let format: Date.FormatStyle = switch period {
-        case .day: .dateTime.month(.abbreviated).day()
-        case .week: .dateTime.month(.abbreviated).day()
-        case .month: .dateTime.month(.abbreviated)
-        }
-        return VStack(alignment: .leading, spacing: 12) {
-            Text(shown.map { "\(period == .week ? "Week of " : "")\($0.start.formatted(format)): \(Store.money($0.total))" } ?? " ")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
-            Chart {
-                ForEach(points, id: \.start) { point in
-                    LineMark(x: .value("Date", point.start), y: .value("Spent", point.total))
-                        .foregroundStyle(Color.accentColor)
-                    AreaMark(x: .value("Date", point.start), y: .value("Spent", point.total))
-                        .foregroundStyle(Color.accentColor.opacity(0.12))
-                }
-                RuleMark(y: .value("Average", average))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                    .foregroundStyle(.secondary.opacity(0.6))
-                if let shown {
-                    PointMark(x: .value("Date", shown.start), y: .value("Spent", shown.total))
-                        .foregroundStyle(Color.accentColor)
-                }
-            }
-            .chartXSelection(value: $trendSelection)
-            .chartXScale(range: .plotDimension(startPadding: 12, endPadding: 32))
-            .chartXAxis {
-                if period == .month {
-                    AxisMarks(values: points.map(\.start)) { _ in AxisTick(); AxisValueLabel(format: format, anchor: .top).font(.system(size: 10)) }
-                } else {
-                    AxisMarks(values: .automatic(desiredCount: 4)) { _ in AxisValueLabel(format: format).font(.system(size: 10)) }
-                }
-            }
-            .chartYAxis {
-                AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { value in
-                    AxisGridLine()
-                    AxisValueLabel { if let v = value.as(Double.self) { Text(Store.compactMoney(v)).font(.system(size: 10)) } }
-                }
-            }
-            .frame(height: 110)
-        }
-        .padding(.horizontal, Self.inset)
-        .padding(.top, 8)
     }
 
     // MARK: Recurring
@@ -352,7 +302,8 @@ struct MenuView: View {
                     expanded: $recurringExpanded
                 )
                 if recurringExpanded {
-                    ForEach(items) { recurringRow($0) }
+                    let accounts = store.accountsByID
+                    ForEach(items) { recurringRow($0, account: $0.sample.accountId.flatMap { accounts[$0] }) }
                     if !dismissed.isEmpty {
                         restoreNote("\(dismissed.count) dismissed", help: "Marked as not recurring. Click to restore.",
                                     names: dismissed, itemTitle: { "Restore \($0)" }, allTitle: "Restore all",
@@ -363,10 +314,11 @@ struct MenuView: View {
         }
     }
 
-    private func recurringRow(_ item: Recurring) -> some View {
+    private func recurringRow(_ item: Recurring, account: Account?) -> some View {
         let next = item.next.formatted(.dateTime.month(.abbreviated).day())
         let counted = store.isCounted(item.name)
-        let via = item.account.map { " · \($0)" } ?? ""
+        // Shorter than shortName's "credit card ••1009", which would push the line past the row width.
+        let via = account.map { a in " · " + (a.displayName.count <= 16 ? a.shortName : "Card" + (a.mask.map { " ••\($0)" } ?? "")) } ?? ""
         return Button {
             ActionMenu.show([.action("Not a recurring charge") { store.dismissRecurring(item.name) }])
         } label: {
@@ -862,6 +814,64 @@ private struct RowButtonStyle: ButtonStyle {
                 .opacity(isEnabled ? 1 : 0.5)
                 .onHover { hovering = $0 }
         }
+    }
+}
+
+/// The trend chart keeps its own hover state, so moving the mouse over it redraws only the chart, not the whole menu.
+private struct TrendChart: View {
+    let points: [(start: Date, total: Double)]
+    let average: Double
+    let selected: Date
+    let period: Period
+    @State private var selection: Date?
+
+    var body: some View {
+        let hovered = selection.flatMap { date in points.min { abs($0.start.timeIntervalSince(date)) < abs($1.start.timeIntervalSince(date)) } }
+        let shown = hovered ?? points.first { $0.start == selected }
+        let format: Date.FormatStyle = switch period {
+        case .day: .dateTime.month(.abbreviated).day()
+        case .week: .dateTime.month(.abbreviated).day()
+        case .month: .dateTime.month(.abbreviated)
+        }
+        return VStack(alignment: .leading, spacing: 12) {
+            Text(shown.map { "\(period == .week ? "Week of " : "")\($0.start.formatted(format)): \(Store.money($0.total))" } ?? " ")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Chart {
+                ForEach(points, id: \.start) { point in
+                    LineMark(x: .value("Date", point.start), y: .value("Spent", point.total))
+                        .foregroundStyle(Color.accentColor)
+                    AreaMark(x: .value("Date", point.start), y: .value("Spent", point.total))
+                        .foregroundStyle(Color.accentColor.opacity(0.12))
+                }
+                RuleMark(y: .value("Average", average))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .foregroundStyle(.secondary.opacity(0.6))
+                if let shown {
+                    PointMark(x: .value("Date", shown.start), y: .value("Spent", shown.total))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .chartXSelection(value: $selection)
+            .chartXScale(range: .plotDimension(startPadding: 12, endPadding: 32))
+            .chartXAxis {
+                if period == .month {
+                    AxisMarks(values: points.map(\.start)) { _ in AxisTick(); AxisValueLabel(format: format, anchor: .top).font(.system(size: 10)) }
+                } else {
+                    AxisMarks(values: .automatic(desiredCount: 4)) { _ in AxisValueLabel(format: format).font(.system(size: 10)) }
+                }
+            }
+            .chartYAxis {
+                AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { value in
+                    AxisGridLine()
+                    AxisValueLabel { if let v = value.as(Double.self) { Text(Store.compactMoney(v)).font(.system(size: 10)) } }
+                }
+            }
+            .frame(height: 110)
+        }
+        .padding(.horizontal, MenuView.inset)
+        .padding(.top, 8)
     }
 }
 
