@@ -254,6 +254,41 @@ final class Store {
 
     var isConfigured: Bool { plaid != nil }
 
+    /// Whether the keys in use come from the Keychain (as opposed to a developer's `.env`).
+    var hasStoredKeys: Bool { PlaidKeys.stored != nil }
+
+    /// Checks the keys with Plaid, and only then saves them to the Keychain and starts using them. Throws a message fit to
+    /// show the user.
+    func connectPlaid(_ keys: PlaidKeys) async throws {
+        let candidate = Plaid(config: keys.config)
+        do {
+            try await candidate.validateKeys()
+        } catch let error as PlaidError {
+            // Plaid's own wording ("client_id must be a properly formatted…") isn't helpful here. Anything that isn't Plaid
+            // being down or busy means the keys were refused.
+            let outage = ["INTERNAL_SERVER_ERROR", "PLANNED_MAINTENANCE", "RATE_LIMIT_EXCEEDED", "INSTITUTION_DOWN"]
+            if outage.contains(error.code) { throw PlaidError(code: error.code, message: "Plaid isn't responding right now. Try again in a moment.") }
+            throw PlaidError(code: error.code, message: "Plaid didn't accept those keys. Check that the client ID and secret belong together, and that the secret is for the \(keys.environment.rawValue) environment.")
+        } catch {
+            throw PlaidError(code: "NETWORK", message: "Couldn't reach Plaid to check the keys. Check your connection and try again.")
+        }
+        guard keys.save() else { throw PlaidError(code: "KEYCHAIN", message: "Couldn't save the keys to your Keychain.") }
+        plaid = candidate
+        message = nil
+        Task { await refresh() }
+    }
+
+    #if DEBUG
+    /// For design review: behave as if no keys were set up, without touching the Keychain.
+    func debugDisconnect() { plaid = nil }
+    #endif
+
+    /// Forgets the keys. Banks linked under them stay in the cache but can't sync until keys are added again.
+    func removePlaidKeys() {
+        PlaidKeys.remove()
+        plaid = nil
+    }
+
     /// `autoRefresh: false` skips network activity (used by the debug snapshot renderer).
     init(autoRefresh: Bool = true) {
         load()

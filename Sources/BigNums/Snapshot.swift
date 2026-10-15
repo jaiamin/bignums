@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Debug-only: renders the menu to a PNG so the design can be reviewed without clicking the menu bar.
 /// `BIGNUMS_SNAPSHOT=out.png [BIGNUMS_TAB=spend|bills|balances] [BIGNUMS_LENS=merchants|categories|cards|trend]
-/// [BIGNUMS_PERIOD=Day|Week|Month] [BIGNUMS_DARK=1] [BIGNUMS_REFRESH=1] [BIGNUMS_ASK_OPEN=1] [BIGNUMS_ASK='question|another'] [BIGNUMS_HIDDEN=merchant] [BIGNUMS_DISMISSED=merchant] swift run`
+/// [BIGNUMS_PERIOD=Day|Week|Month] [BIGNUMS_DARK=1] [BIGNUMS_REFRESH=1] [BIGNUMS_ASK_OPEN=1] [BIGNUMS_NOKEYS=1] [BIGNUMS_SETTINGS=1] [BIGNUMS_ASK='question|another'] [BIGNUMS_HIDDEN=merchant] [BIGNUMS_DISMISSED=merchant] swift run`
 @MainActor
 enum Snapshot {
     static func renderIfRequested() {
@@ -44,8 +44,12 @@ enum Snapshot {
                 if let turn = assistant.turns.last { print("Q: \(turn.question)\nA: \(turn.answer)  [\(String(format: "%.1f", Date().timeIntervalSince(start)))s]\n") }
             }
         }
-        let root = MenuView(store: store)
-            .background(Color(nsColor: .windowBackgroundColor))
+        if env["BIGNUMS_NOKEYS"] != nil { store.debugDisconnect() }  // the first-run welcome
+        // The Settings window, or the menu.
+        let root = Group {
+            if env["BIGNUMS_SETTINGS"] != nil { SettingsView(store: store) } else { MenuView(store: store) }
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
         let host = NSHostingView(rootView: root)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 800), styleMask: .borderless,
                               backing: .buffered, defer: false)

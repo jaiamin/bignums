@@ -11,29 +11,43 @@ struct PlaidConfig {
     let secret: String
     let baseURL: String
 
-    /// Reads `.env` from the app bundle (copied in by build.sh) or the working directory (`swift run`).
+    /// The user's keys from the Keychain. For development only, `PLAID_CLIENT_ID` and `PLAID_SECRET` from the environment or a
+    /// `.env` in the working directory (`swift run`) also work. Never from inside the app bundle: a secret there would travel
+    /// with the app to anyone it's shared with.
     static func load() throws -> PlaidConfig {
-        var values: [String: String] = [:]
-        let candidates = [
-            Bundle.main.resourceURL?.appendingPathComponent(".env"),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".env"),
-        ].compactMap { $0 }
-        if let text = candidates.lazy.compactMap({ try? String(contentsOf: $0, encoding: .utf8) }).first {
-            for line in text.split(whereSeparator: \.isNewline) {
-                let parts = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-                guard parts.count == 2, !parts[0].hasPrefix("#") else { continue }
-                values[parts[0]] = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            }
-        }
+        if let keys = PlaidKeys.stored { return keys.config }
+        let cwdEnv = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".env")
+        let values = parseEnvFile(cwdEnv)
         let env = ProcessInfo.processInfo.environment
         func value(_ key: String) -> String { values[key].flatMap { $0.isEmpty ? nil : $0 } ?? env[key] ?? "" }
 
         let clientID = value("PLAID_CLIENT_ID"), secret = value("PLAID_SECRET")
         guard !clientID.isEmpty, !secret.isEmpty else {
-            throw PlaidError(code: "CONFIG", message: "Add PLAID_CLIENT_ID and PLAID_SECRET to .env, then rebuild.")
+            throw PlaidError(code: "CONFIG", message: "Add your Plaid keys to get started.")
         }
         let plaidEnv = value("PLAID_ENV").isEmpty ? "production" : value("PLAID_ENV")
         return PlaidConfig(clientID: clientID, secret: secret, baseURL: "https://\(plaidEnv).plaid.com")
+    }
+
+    /// `KEY=value` lines, ignoring comments and surrounding quotes.
+    static func parseEnvFile(_ url: URL) -> [String: String] {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
+        var values: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2, !parts[0].hasPrefix("#") else { continue }
+            values[parts[0]] = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        }
+        return values
+    }
+
+    /// Moves the keys from a `.env` file into the Keychain. Used by `build.sh`, so a developer's keys are never copied into the app.
+    @discardableResult
+    static func importEnvFile(_ url: URL) -> Bool {
+        let values = parseEnvFile(url)
+        guard let clientID = values["PLAID_CLIENT_ID"], let secret = values["PLAID_SECRET"], !clientID.isEmpty, !secret.isEmpty else { return false }
+        let environment = PlaidEnvironment(rawValue: values["PLAID_ENV"] ?? "") ?? .production
+        return PlaidKeys(clientID: clientID, secret: secret, environment: environment).save()
     }
 }
 
@@ -164,6 +178,12 @@ struct Plaid {
             "options": ["include_optional_metadata": true],
         ])
         return r.institution
+    }
+
+    /// Asks Plaid for one institution, which any valid pair of keys can do, so a typo shows up right away.
+    func validateKeys() async throws {
+        struct Response: Decodable {}
+        let _: Response = try await call("/institutions/get", ["count": 1, "offset": 0, "country_codes": ["US"]])
     }
 
     func accounts(accessToken: String) async throws -> [Account] {

@@ -6,6 +6,12 @@ struct BigNumsApp: App {
     @State private var store: Store
 
     init() {
+        // `build.sh` uses this to move a developer's `.env` keys into the Keychain, so they're never copied into the app.
+        if let flag = CommandLine.arguments.firstIndex(of: "--import-env"), CommandLine.arguments.indices.contains(flag + 1) {
+            let imported = PlaidConfig.importEnvFile(URL(fileURLWithPath: CommandLine.arguments[flag + 1]))
+            print(imported ? "Plaid keys saved to the Keychain." : "No Plaid keys found to import.")
+            exit(imported ? 0 : 1)
+        }
         #if DEBUG
         Snapshot.renderIfRequested()
         #endif
@@ -18,6 +24,23 @@ struct BigNumsApp: App {
         MenuBarExtra {
             MenuView(store: store)
         } label: {
+            StatusLabel(store: store)
+        }
+        .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView(store: store)
+        }
+    }
+}
+
+/// What the menu bar item shows. It exists from launch, which makes it the place to pick up SwiftUI's `openSettings` action.
+private struct StatusLabel: View {
+    let store: Store
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Group {
             if store.isConfigured {
                 if store.menuBarStyle == .iconOnly {
                     Image(systemName: "dollarsign.circle")
@@ -28,7 +51,14 @@ struct BigNumsApp: App {
                 Image(systemName: "exclamationmark.triangle")
             }
         }
-        .menuBarExtraStyle(.window)
+        .task {
+            SettingsWindow.opener = { openSettings() }
+            // `open -a BigNums --args --settings` opens Settings straight away.
+            if CommandLine.arguments.contains("--settings") {
+                try? await Task.sleep(for: .milliseconds(600))
+                SettingsWindow.open()
+            }
+        }
     }
 }
 

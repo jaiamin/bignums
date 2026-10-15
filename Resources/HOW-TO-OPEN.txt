@@ -1,0 +1,32 @@
+BigNums: how to open it the first time
+======================================
+
+BigNums isn't signed with a paid Apple Developer ID, so macOS shows a warning the
+first time you open it. That's expected, and it only happens once. The app has no
+server and no account: your bank data stays between your Mac and your own Plaid
+account.
+
+1. Drag BigNums into the Applications folder.
+
+2. Open it from Applications. macOS says it can't verify BigNums.
+   Click "Done" (not "Move to Trash").
+
+3. Open System Settings > Privacy & Security, scroll down to the Security section,
+   and click "Open Anyway" next to BigNums. Enter your password.
+
+4. Open BigNums again and click "Open".
+
+   (On macOS 14 you can instead right-click BigNums, choose Open, and click Open.)
+
+Prefer Terminal? Run this once, then open the app normally:
+
+    xattr -dr com.apple.quarantine /Applications/BigNums.app
+
+
+After it opens
+--------------
+BigNums lives in your menu bar (top right). Click it, then "Set up Plaid..." and
+paste your own free Plaid keys. The steps are in the Settings window.
+
+Needs macOS 14 or later. The "Ask" assistant needs macOS 26 with Apple Intelligence
+turned on; everything else works without it.

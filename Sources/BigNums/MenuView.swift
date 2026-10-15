@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 /// The menu bar window: one tab at a time, a line for anything that needs attention, and a footer to move around.
@@ -11,13 +12,17 @@ struct MenuView: View {
     @State private var window: NSWindow?
     @State private var contentHeight: CGFloat = 0
     @State private var isOpen = false
+    @State private var session = UUID()  // a new value is a fresh menu: scroll positions and view state start over
+    @State private var observers = WindowObservers()
 
     /// Everything shares one left edge: the outer padding plus this inset, which leaves room for row hover highlights.
     static let inset: CGFloat = 6
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if store.connections.isEmpty {
+            if !store.isConfigured {
+                welcome
+            } else if store.connections.isEmpty {
                 emptyState
             } else {
                 if let issue {
@@ -28,11 +33,13 @@ struct MenuView: View {
                 }
                 if asking && assistantVisible {
                     AskView(store: store)
+                        .id(session)
                 } else {
                     CappedScroll(maxHeight: MenuMetrics.tabMaxHeight) {
                         tabContent
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .id(session)
                 }
             }
 
@@ -59,6 +66,7 @@ struct MenuView: View {
         }
         .background(WindowReader { found in
             window = found
+            observeVisibility(of: found)
             fitWindow(found, to: contentHeight)
         })
         .background(shortcuts)
@@ -74,17 +82,36 @@ struct MenuView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             if note.object as? NSWindow === window { isOpen = true }
         }
-        // Closing the menu returns it to the start, so it never reopens on old numbers or another tab.
+        // Losing focus also means it was dismissed (visibility, below, is the more reliable signal; either one resets).
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { note in
-            if note.object as? NSWindow === window {
-                isOpen = false
-                asking = false
-                offset = 0
-                removing = nil
-                tab = .spend
-            }
+            if note.object as? NSWindow === window { resetToStart() }
         }
         .task { await store.refreshIfStale() }
+    }
+
+    /// Closing the menu returns it to the start, so it never reopens on old numbers, another tab, a half-finished
+    /// confirmation or a scrolled-down list. The chat itself is kept: it's history, not view state.
+    private func resetToStart() {
+        isOpen = false
+        asking = false
+        tab = .spend
+        offset = 0
+        removing = nil
+        UserDefaults.standard.set(Lens.merchants.rawValue, forKey: "lens")
+        session = UUID()
+    }
+
+    /// Reacts to the window actually appearing and disappearing, which happens however it's dismissed: clicking the menu bar
+    /// item again, clicking elsewhere, or Escape. Losing key status alone isn't reliably sent in all of those cases.
+    private func observeVisibility(of window: NSWindow) {
+        observers.bag.removeAll()
+        window.publisher(for: \.isVisible)
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { visible in
+                if visible { isOpen = true } else { resetToStart() }
+            }
+            .store(in: &observers.bag)
     }
 
     /// The sparkle button and Ask screen exist only where the on-device model could ever run, and unless switched off.
@@ -122,6 +149,24 @@ struct MenuView: View {
 
     // MARK: Empty state & footer
 
+    /// First run: BigNums needs the user's own Plaid keys, which are entered in the Settings window (the menu would close the
+    /// moment they went to the Plaid dashboard to copy them).
+    private var welcome: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Welcome to BigNums")
+                .font(.system(size: 15, weight: .semibold))
+            Text("BigNums reads your accounts through Plaid, using your own free Plaid keys, so your data stays between your Mac and Plaid. Setup takes about five minutes.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Set up Plaid…") { SettingsWindow.open() }
+                .buttonStyle(.borderedProminent)
+                .padding(.top, 8)
+        }
+        .padding(.horizontal, Self.inset)
+        .padding(.vertical, 4)
+    }
+
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("See what you spend")
@@ -151,11 +196,11 @@ struct MenuView: View {
 
     private var footer: some View {
         HStack(spacing: 4) {
-            if !store.connections.isEmpty {
+            if !store.connections.isEmpty && store.isConfigured {
                 TabBar(selection: Binding(get: { tab }, set: { tab = $0; asking = false }), attention: attention, active: !asking)
             }
             Spacer()
-            if assistantVisible && !store.connections.isEmpty {
+            if assistantVisible && store.isConfigured && !store.connections.isEmpty {
                 Button { asking.toggle() } label: {
                     Image(systemName: "sparkles")
                         .font(.system(size: 11, weight: .medium))
@@ -210,6 +255,7 @@ struct MenuView: View {
             Button("") { tab = .spend }.keyboardShortcut("1")
             Button("") { tab = .bills }.keyboardShortcut("2")
             Button("") { tab = .balances }.keyboardShortcut("3")
+            Button("") { SettingsWindow.open() }.keyboardShortcut(",")
             Button("") { if assistantVisible { asking.toggle() } }.keyboardShortcut("k")
             Button("") { asking = false }.keyboardShortcut(.cancelAction)
             Button("") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
@@ -217,4 +263,9 @@ struct MenuView: View {
         .opacity(0)
         .allowsHitTesting(false)
     }
+}
+
+/// Keeps the window observers alive for as long as the menu exists.
+private final class WindowObservers {
+    var bag: Set<AnyCancellable> = []
 }

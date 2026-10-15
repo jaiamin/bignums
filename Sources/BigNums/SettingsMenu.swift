@@ -19,6 +19,33 @@ enum LaunchAtLogin {
     }
 }
 
+/// Opens the Settings window. A menu bar app has no Dock icon, and such apps' windows don't reliably come to the front or
+/// take typing, so while Settings is open the app presents itself as a regular app, then goes back to the menu bar.
+@MainActor
+enum SettingsWindow {
+    private static var observer: NSObjectProtocol?
+    /// SwiftUI's own action for opening the Settings scene. It can only be obtained from inside a view, so a view that always
+    /// exists (the menu bar label) hands it over here.
+    static var opener: (() -> Void)?
+
+    static func open() {
+        // The menu has done its job once Settings is wanted: close it rather than leave it open behind the window.
+        NSApp.windows.filter { $0.level == .popUpMenu }.forEach { $0.orderOut(nil) }
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        // One turn later, so the app has finished switching to a regular app before the window is asked for.
+        DispatchQueue.main.async {
+            if let opener { opener() } else { NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) }
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        guard observer == nil else { return }
+        observer = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+            guard let window = note.object as? NSWindow, window.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true else { return }
+            MainActor.assumeIsolated { NSApp.setActivationPolicy(.accessory) }
+        }
+    }
+}
+
 /// The settings shown by both the gear button and a right click on the menu bar item, so they can't drift apart.
 @MainActor
 enum SettingsMenu {
@@ -37,6 +64,7 @@ enum SettingsMenu {
             items.append(.action("Open at login", checked: LaunchAtLogin.isEnabled) { LaunchAtLogin.toggle() })
         }
         items.append(.action("Notify on new charges", checked: store.notifyCharges) { store.notifyCharges.toggle() })
+        items.append(.action("Settings…") { SettingsWindow.open() })
         if AssistantSupport.status != .notSupported {
             let enabled = UserDefaults.standard.object(forKey: "assistantEnabled") as? Bool ?? true
             items.append(.action("Ask assistant (experimental)", checked: enabled) {
