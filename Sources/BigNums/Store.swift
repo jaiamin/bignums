@@ -156,6 +156,24 @@ extension Transaction {
     var merchant: String { merchantName ?? name ?? "Other" }
 }
 
+/// What the menu bar item shows.
+enum MenuBarStyle: String, CaseIterable, Identifiable {
+    case all, today, week, month, netWorth, iconOnly
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .all: "Day | Week | Month"
+        case .today: "Today"
+        case .week: "This week"
+        case .month: "This month"
+        case .netWorth: "Net worth"
+        case .iconOnly: "Icon only"
+        }
+    }
+}
+
 @MainActor @Observable
 final class Store {
     private(set) var connections: [Connection] = []
@@ -191,6 +209,11 @@ final class Store {
     /// Merchants the user said aren't recurring charges (a false match). Only affects Recurring. Stored in UserDefaults.
     private(set) var dismissedRecurring: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "dismissedRecurring") ?? []) {
         didSet { UserDefaults.standard.set(Array(dismissedRecurring), forKey: "dismissedRecurring")}
+    }
+
+    /// Which number the menu bar item shows. Stored in UserDefaults.
+    var menuBarStyle = MenuBarStyle(rawValue: UserDefaults.standard.string(forKey: "menuBarStyle") ?? "") ?? .all {
+        didSet { UserDefaults.standard.set(menuBarStyle.rawValue, forKey: "menuBarStyle") }
     }
 
     /// Menu bar shows a placeholder instead of the amounts (for screen sharing, or just privacy). Stored in UserDefaults.
@@ -537,17 +560,29 @@ final class Store {
         return result.sorted { $0.next < $1.next }
     }
 
-    /// Menu bar text: always the current day, week and month, whatever the menu is browsing.
-    var label: String {
-        if hideNumbers { return Period.allCases.map { _ in "$•••" }.joined(separator: " | ") }
-        return Period.allCases
-            .map { Self.compactMoney(breakdown($0.interval(offset: 0, from: referenceDate)).total) }
-            .joined(separator: " | ")
+    /// Menu bar text for the chosen style. Day, week and month always mean the current one, whatever the menu is browsing.
+    var label: String { label(for: menuBarStyle) }
+
+    func label(for style: MenuBarStyle) -> String {
+        func spent(_ period: Period) -> String {
+            hideNumbers ? "$•••" : Self.compactMoney(breakdown(period.interval(offset: 0, from: referenceDate)).total)
+        }
+        switch style {
+        case .all: return Period.allCases.map(spent).joined(separator: " | ")
+        case .today: return "Today \(spent(.day))"
+        case .week: return "Week \(spent(.week))"
+        case .month: return "Month \(spent(.month))"
+        case .netWorth:
+            guard let worth = netWorth, worth.hasBalances else { return "Net worth —" }
+            return "Net worth \(hideNumbers ? "$•••" : Self.compactMoney(worth.total))"
+        case .iconOnly: return ""
+        }
     }
 
     /// "$987", "$3.2K", "$12.6K", "$126K": keeps the menu bar item narrow and roughly the same width all month,
     /// so macOS doesn't hide it behind the notch. The exact figure is in the menu.
     static func compactMoney(_ value: Double) -> String {
+        if value <= -0.5 { return "−" + compactMoney(-value) }  // a negative net worth, say
         let rounded = value.rounded()
         if rounded < 1000 { return "$\(Int(rounded))" }
         let (scaled, suffix) = rounded < 1_000_000 ? (rounded / 1000, "K") : (rounded / 1_000_000, "M")

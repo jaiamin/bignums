@@ -26,6 +26,8 @@ PLIST
 codesign --force --sign - "$APP"
 
 pkill -x BigNums || true
+# Wait for the old copy to actually exit, or `open` can race it and fail with error -600.
+for _ in {1..40}; do pgrep -x BigNums >/dev/null || break; sleep 0.1; done
 if [[ "${1:-}" == "--install" ]]; then
   rm -rf /Applications/BigNums.app && cp -R "$APP" /Applications/ && APP=/Applications/BigNums.app
 fi

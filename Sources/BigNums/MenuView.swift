@@ -201,26 +201,7 @@ struct MenuView: View {
     }
 
     private func showSettings() {
-        var items: [ActionMenu.Item] = [
-            .label(updatedText),
-            .divider,
-            .action("Show numbers in menu bar", checked: !store.hideNumbers) { store.hideNumbers.toggle() },
-            .action("Notify on new charges", checked: store.notifyCharges) { store.notifyCharges.toggle() },
-        ]
-        if AssistantSupport.status != .notSupported {
-            items.append(.action("Ask assistant (experimental)", checked: assistantEnabled) {
-                assistantEnabled.toggle()
-                if !assistantEnabled { asking = false }
-            })
-        }
-        // Merchants set aside stay reachable even in a period where they didn't charge you.
-        let hidden = store.hiddenMerchants.sorted()
-        if !hidden.isEmpty {
-            items += [.divider, .label("Not counted")]
-            items += hidden.map { name in .action("Count \(name) again") { store.unhide(name) } }
-        }
-        items += [.divider, .action("Quit BigNums") { NSApplication.shared.terminate(nil) }]
-        ActionMenu.show(items)
+        ActionMenu.show(SettingsMenu.items(store: store, status: updatedText))
     }
 
     /// ⌘1–3 switch tabs and ⌘Q quits, without any visible controls.

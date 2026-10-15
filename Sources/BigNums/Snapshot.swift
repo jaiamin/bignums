@@ -8,6 +8,11 @@ import SwiftUI
 enum Snapshot {
     static func renderIfRequested() {
         let env = ProcessInfo.processInfo.environment
+        if env["BIGNUMS_LABELS"] != nil {  // what the menu bar item would say for each style
+            let store = Store(autoRefresh: false)
+            for style in MenuBarStyle.allCases { print("\(style.title): \(store.label(for: style))") }
+            exit(0)
+        }
         guard let path = env["BIGNUMS_SNAPSHOT"] else { return }
         if let period = env["BIGNUMS_PERIOD"] { UserDefaults.standard.set(period, forKey: "period") }
         UserDefaults.standard.set(env["BIGNUMS_TAB"] ?? "spend", forKey: "tab")

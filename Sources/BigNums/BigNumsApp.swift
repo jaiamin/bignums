@@ -19,7 +19,11 @@ struct BigNumsApp: App {
             MenuView(store: store)
         } label: {
             if store.isConfigured {
-                Text(store.label).monospacedDigit()
+                if store.menuBarStyle == .iconOnly {
+                    Image(systemName: "dollarsign.circle")
+                } else {
+                    Text(store.label).monospacedDigit()
+                }
             } else {
                 Image(systemName: "exclamationmark.triangle")
             }
@@ -37,13 +41,7 @@ enum StatusItemMenu {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
             guard let window = event.window, window.className.contains("StatusBar") else { return event }
-            ActionMenu.show([
-                .action("Show numbers", checked: !store.hideNumbers) { store.hideNumbers.toggle() },
-                .action("Notify on new charges", checked: store.notifyCharges) { store.notifyCharges.toggle() },
-                .divider,
-                .action("Refresh now") { Task { await store.refresh() } },
-                .action("Quit BigNums") { NSApplication.shared.terminate(nil) },
-            ])
+            ActionMenu.show(SettingsMenu.items(store: store))
             return nil
         }
     }
