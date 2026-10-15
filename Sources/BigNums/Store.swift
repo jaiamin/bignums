@@ -299,6 +299,38 @@ final class Store {
         return result
     }
 
+    // MARK: Usual spending
+
+    /// What you typically spend over the same stretch as `interval`, as the median of recent comparable periods, so a
+    /// single odd month or one big charge doesn't skew it. For the current week/month that's the same point in the period
+    /// ("by now"); for a finished one, the whole period; for a day, a whole day of the same weekday. Nil until there are
+    /// at least 3 earlier periods of history to learn from.
+    func usualSpending(_ period: Period, interval: DateInterval, isCurrent: Bool) -> Double? {
+        guard let historyStart else { return nil }
+        let cal = Calendar.current
+        var totals: [Double] = []
+        let count = period == .month ? 6 : 8
+        let elapsedDays = (cal.dateComponents([.day], from: interval.start, to: cal.startOfDay(for: referenceDate)).day ?? 0) + 1
+        for k in 1...count {
+            let past: DateInterval
+            if period == .day {
+                guard let start = cal.date(byAdding: .day, value: -7 * k, to: interval.start),
+                      let end = cal.date(byAdding: .day, value: 1, to: start) else { continue }
+                past = DateInterval(start: start, end: end)
+            } else {
+                past = period.interval(offset: -k, from: interval.start)
+            }
+            guard past.start >= historyStart else { break }
+            var end = past.end
+            if isCurrent, period != .day, let cut = cal.date(byAdding: .day, value: elapsedDays, to: past.start) { end = min(cut, past.end) }
+            totals.append(breakdown(DateInterval(start: past.start, end: end)).total)
+        }
+        guard totals.count >= 3 else { return nil }
+        totals.sort()
+        let mid = totals.count / 2
+        return totals.count % 2 == 1 ? totals[mid] : (totals[mid - 1] + totals[mid]) / 2
+    }
+
     func toggleExcluded(_ accountID: String) {
         if excludedAccounts.contains(accountID) { excludedAccounts.remove(accountID) } else { excludedAccounts.insert(accountID) }
     }

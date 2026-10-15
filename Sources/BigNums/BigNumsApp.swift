@@ -137,7 +137,7 @@ struct MenuView: View {
                 .foregroundStyle(.secondary)
             HeroAmount(value: breakdown.total)
             // Always reserve the line so the menu doesn't change height when there's nothing to compare.
-            Text(comparison(interval, spent: breakdown.total) ?? " ")
+            (comparison(interval, spent: breakdown.total) ?? Text(" "))
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
         }
@@ -557,32 +557,21 @@ struct MenuView: View {
         }
     }
 
-    /// One line of context: a day vs. the average day before it; a running week/month vs. the previous one up to the
-    /// same point (Oct 1–7 vs. Sep 1–7); a finished week/month vs. the whole one before it.
-    private func comparison(_ interval: DateInterval, spent: Double) -> String? {
-        let cal = Calendar.current
-        guard let historyStart = store.historyStart else { return nil }
-        let reference: Double
-        let phrase: String
-        if period == .day {
-            // 28 days = 4 full weeks, so weekends and weekdays weigh equally.
-            guard let start = cal.date(byAdding: .day, value: -28, to: interval.start), start >= historyStart else { return nil }
-            reference = store.breakdown(DateInterval(start: start, end: interval.start)).total / 28
-            phrase = "your daily average"
-        } else {
-            guard let previousStart = cal.date(byAdding: period.component, value: -1, to: interval.start),
-                  previousStart >= historyStart else { return nil }
-            var end = interval.start
-            if offset == 0 {
-                let elapsedDays = (cal.dateComponents([.day], from: interval.start, to: cal.startOfDay(for: store.referenceDate)).day ?? 0) + 1
-                end = min(cal.date(byAdding: .day, value: elapsedDays, to: previousStart) ?? end, end)
-            }
-            reference = store.breakdown(DateInterval(start: previousStart, end: end)).total
-            phrase = offset == 0 ? "this time last \(period.unit)" : "the \(period.unit) before"
+    /// One line of context: what you usually spend over the same stretch, and how this compares. Over is orange;
+    /// under stays quiet, so spending less never reads as a warning.
+    private func comparison(_ interval: DateInterval, spent: Double) -> Text? {
+        let isCurrent = offset == 0
+        guard let usual = store.usualSpending(period, interval: interval, isCurrent: isCurrent) else { return nil }
+        let when: String = switch period {
+        case .day: "on \(interval.start.formatted(.dateTime.weekday(.wide)))s"
+        case .week: isCurrent ? "by now" : "a week"
+        case .month: isCurrent ? "by now" : "a month"
         }
-        let difference = spent - reference
-        if abs(difference) < 1 { return "About the same as \(phrase)" }
-        return "\(Store.money(abs(difference))) \(difference > 0 ? "more" : "less") than \(phrase)"
+        let difference = spent - usual
+        let head = Text("Usually \(Store.money(usual)) \(when)")
+        if abs(difference) < 1 { return head + Text(" · about the same") }
+        let tail = Text(" · \(Store.money(abs(difference))) \(difference > 0 ? "over" : "under")")
+        return head + (difference > 0 ? tail.foregroundStyle(.orange) : tail)
     }
 }
 
